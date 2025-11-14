@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "src/ironclad_vault_backend"
+]
+resolver = "2"

@@ -1,0 +1,27 @@
+{
+  "canisters": {
+    "ironclad_vault_backend": {
+      "candid": "src/ironclad_vault_backend/ironclad_vault_backend.did",
+      "package": "ironclad_vault_backend",
+      "type": "rust"
+    },
+    "ironclad_vault_frontend": {
+      "dependencies": [
+        "ironclad_vault_backend"
+      ],
+      "source": [
+        "src/ironclad_vault_frontend/dist"
+      ],
+      "type": "assets",
+      "workspace": "ironclad_vault_frontend"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
