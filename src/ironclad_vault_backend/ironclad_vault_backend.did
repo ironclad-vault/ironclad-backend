@@ -1,3 +1,77 @@
+type VaultStatus = variant {
+    PendingDeposit;
+    ActiveLocked;
+    Unlockable;
+    Withdrawn;
+};
+
+type Vault = record {
+    id: nat64;
+    owner: principal;
+    btc_address: text;
+    expected_deposit: nat64;
+    btc_deposit_txid: opt text;
+    btc_withdraw_txid: opt text;
+    lock_until: nat64;
+    status: VaultStatus;
+    balance: nat64;
+    created_at: nat64;
+    updated_at: nat64;
+};
+
+type VaultEvent = record {
+    vault_id: nat64;
+    action: text;
+    timestamp: nat64;
+    notes: text;
+};
+
+type AutoReinvestConfig = record {
+    vault_id: nat64;
+    owner: principal;
+    new_lock_duration: nat64;
+    enabled: bool;
+    created_at: nat64;
+    updated_at: nat64;
+};
+
+type ListingStatus = variant {
+    Active;
+    Cancelled;
+    Filled;
+};
+
+type MarketListing = record {
+    id: nat64;
+    vault_id: nat64;
+    seller: principal;
+    buyer: opt principal;
+    price_sats: nat64;
+    status: ListingStatus;
+    created_at: nat64;
+    updated_at: nat64;
+};
+
 service : {
-    "greet": (text) -> (text) query;
+    create_vault: (nat64, nat64) -> (Vault);
+    get_my_vaults: () -> (vec Vault) query;
+    get_vault: (nat64) -> (opt Vault) query;
+    get_vault_events: (nat64) -> (vec VaultEvent) query;
+    mock_deposit_vault: (nat64, nat64) -> (variant { Ok: Vault; Err: text });
+    is_vault_unlockable: (nat64) -> (variant { Ok: bool; Err: text }) query;
+    unlock_vault: (nat64) -> (variant { Ok: Vault; Err: text });
+    get_unlockable_vaults: () -> (vec Vault) query;
+    preview_withdraw: (nat64) -> (variant { Ok: nat64; Err: text }) query;
+    withdraw_vault: (nat64, nat64) -> (variant { Ok: Vault; Err: text });
+    get_withdrawable_vaults: () -> (vec Vault) query;
+    schedule_auto_reinvest: (nat64, nat64) -> (variant { Ok: AutoReinvestConfig; Err: text });
+    cancel_auto_reinvest: (nat64) -> (variant { Ok: null; Err: text });
+    get_auto_reinvest_config: (nat64) -> (opt AutoReinvestConfig) query;
+    get_my_auto_reinvest_configs: () -> (vec AutoReinvestConfig) query;
+    execute_auto_reinvest: (nat64) -> (variant { Ok: Vault; Err: text });
+    create_listing: (nat64, nat64) -> (variant { Ok: MarketListing; Err: text });
+    cancel_listing: (nat64) -> (variant { Ok: MarketListing; Err: text });
+    get_active_listings: () -> (vec MarketListing) query;
+    get_my_listings: () -> (vec MarketListing) query;
+    buy_listing: (nat64) -> (variant { Ok: Vault; Err: text });
 }
