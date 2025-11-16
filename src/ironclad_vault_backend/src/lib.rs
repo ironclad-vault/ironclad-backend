@@ -1,13 +1,68 @@
 // src/ironclad_vault_backend/src/lib.rs
 
-use candid::{CandidType, Deserialize, Principal};
+use candid::{CandidType, Deserialize, Nat, Principal};
 use ic_cdk::api::{msg_caller, time};
 use ic_cdk_macros::{init, query, update};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+
+// =======================
+// Constants
+// =======================
+
+// ckBTC / ckTESTBTC ledger canister IDs (from official ICP docs)
+// Mainnet ckBTC ledger:      mxzaz-hqaaa-aaaar-qaada-cai
+// Testnet4 ckTESTBTC ledger: mc6ru-gyaaa-aaaar-qaaaq-cai
+const CKBTC_LEDGER_CANISTER_ID: &str = "mc6ru-gyaaa-aaaar-qaaaq-cai";
+// NOTE: swap to mxzaz-hqaaa-aaaar-qaada-cai when pointing to mainnet ckBTC.
+
+// ECDSA key IDs for threshold signing
+// Local dfx replica: "dfx_test_key"
+// Testnet/Mainnet testing: "test_key_1"
+// Production (DO NOT USE in hackathon): "key_1"
+const ECDSA_KEY_NAME: &str = "test_key_1";
 
 // =======================
 // Types
 // =======================
+
+// Helper type for ICRC-1 account (used for ledger calls)
+#[derive(CandidType, Deserialize, Clone)]
+struct Icrc1Account {
+    owner: Principal,
+    subaccount: Option<Vec<u8>>,
+}
+
+// ECDSA types (matching management canister interface)
+#[derive(CandidType, Deserialize)]
+struct EcdsaKeyId {
+    curve: EcdsaCurve,
+    name: String,
+}
+
+#[derive(CandidType, Deserialize)]
+enum EcdsaCurve {
+    #[serde(rename = "secp256k1")]
+    Secp256k1,
+}
+
+#[derive(CandidType, Deserialize)]
+struct SignWithEcdsaArgument {
+    message_hash: Vec<u8>,
+    derivation_path: Vec<Vec<u8>>,
+    key_id: EcdsaKeyId,
+}
+
+#[derive(CandidType, Deserialize)]
+struct SignWithEcdsaResponse {
+    signature: Vec<u8>,
+}
+
+#[derive(Clone, CandidType, Deserialize)]
+pub enum NetworkMode {
+    Mock,
+    CkBTCMainnet,
+}
 
 #[derive(Clone, CandidType, Deserialize)]
 pub enum VaultStatus {
@@ -22,8 +77,9 @@ pub struct Vault {
     pub id: u64,
     pub owner: Principal,
 
-    // BTC-related fields (future-ready)
+    // BTC / ckBTC routing
     pub btc_address: String,
+    pub ckbtc_subaccount: Option<Vec<u8>>,  // NEW: ckBTC subaccount for this vault
     pub expected_deposit: u64,          // in satoshis (can be 0 for now)
     pub btc_deposit_txid: Option<String>,
     pub btc_withdraw_txid: Option<String>,
@@ -95,6 +151,26 @@ pub struct MarketListing {
     pub updated_at: u64,
 }
 
+#[derive(Clone, CandidType, Deserialize)]
+pub struct CkbtcSyncResult {
+    pub vault: Vault,
+    pub synced_balance: u64,
+    pub mode: NetworkMode,
+}
+
+#[derive(Clone, CandidType, Deserialize)]
+pub struct BitcoinTxProof {
+    pub txid: String,
+    pub confirmed: bool,
+    pub confirmations: u32,
+}
+
+#[derive(Clone, CandidType, Deserialize)]
+pub struct SignatureResponse {
+    pub message: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct State {
     pub next_id: u64,
@@ -111,6 +187,7 @@ pub struct State {
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    static MODE: RefCell<NetworkMode> = RefCell::new(NetworkMode::Mock);
 }
 
 fn with_state<R>(f: impl FnOnce(&State) -> R) -> R {
@@ -129,6 +206,17 @@ fn with_state_mut<R>(f: impl FnOnce(&mut State) -> R) -> R {
 
 fn now_sec() -> u64 {
     time() / 1_000_000_000
+}
+
+fn get_mode() -> NetworkMode {
+    MODE.with(|m| m.borrow().clone())
+}
+
+fn ecdsa_key_id() -> EcdsaKeyId {
+    EcdsaKeyId {
+        curve: EcdsaCurve::Secp256k1,
+        name: ECDSA_KEY_NAME.to_string(),
+    }
 }
 
 fn record_event(vault_id: u64, action: &str, notes: &str) {
@@ -171,10 +259,15 @@ fn create_vault(lock_until: u64, expected_deposit: u64) -> Vault {
         // TODO: replace placeholder with real BTC address derivation
         let btc_address = format!("IRONCLAD-VAULT-{}", id);
 
+        // Generate deterministic ckBTC subaccount based on vault id
+        let mut sub = vec![0u8; 32];
+        sub[0..8].copy_from_slice(&id.to_be_bytes());
+
         let vault = Vault {
             id,
             owner: caller,
             btc_address,
+            ckbtc_subaccount: Some(sub),
             expected_deposit,
             btc_deposit_txid: None,
             btc_withdraw_txid: None,
@@ -659,10 +752,15 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
         let new_id = state.next_id;
         state.next_id += 1;
 
+        // Generate ckBTC subaccount for new vault
+        let mut sub = vec![0u8; 32];
+        sub[0..8].copy_from_slice(&new_id.to_be_bytes());
+
         let new_vault = Vault {
             id: new_id,
             owner: caller,
             btc_address: format!("IRONCLAD-VAULT-{}", new_id),
+            ckbtc_subaccount: Some(sub),
             expected_deposit: old_balance,
             btc_deposit_txid: None,
             btc_withdraw_txid: None,
@@ -989,6 +1087,234 @@ fn buy_listing(listing_id: u64) -> Result<Vault, String> {
     }
 
     result
+}
+
+// =======================
+// Network Mode Control
+// =======================
+
+/// Set runtime mode to Mock (for development/testing)
+#[update]
+fn set_mode_mock() {
+    MODE.with(|m| *m.borrow_mut() = NetworkMode::Mock);
+}
+
+/// Set runtime mode to ckBTC Mainnet (for production)
+#[update]
+fn set_mode_ckbtc_mainnet() {
+    MODE.with(|m| *m.borrow_mut() = NetworkMode::CkBTCMainnet);
+}
+
+/// Get current runtime mode
+#[query]
+fn get_mode_query() -> NetworkMode {
+    get_mode()
+}
+
+// =======================
+// ckBTC Integration (Placeholder)
+// =======================
+
+/// Sync vault balance from ckBTC ledger (real integration)
+#[update]
+async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult, String> {
+    let caller = msg_caller();
+    let mode = get_mode();
+
+    // Only allow in CkBTCMainnet mode
+    if !matches!(mode, NetworkMode::CkBTCMainnet) {
+        return Err("ckBTC sync is only available in CkBTCMainnet mode".to_string());
+    }
+
+    // Find vault and ensure ownership
+    let maybe_vault = with_state(|state| {
+        state
+            .vaults
+            .iter()
+            .find(|v| v.id == vault_id && v.owner == caller)
+            .cloned()
+    });
+
+    let vault = match maybe_vault {
+        Some(v) => v,
+        None => return Err("Vault not found or unauthorized".to_string()),
+    };
+
+    // Ensure vault has ckBTC subaccount
+    if vault.ckbtc_subaccount.is_none() {
+        return Err("Vault has no ckBTC subaccount configured".to_string());
+    }
+
+    // Call ckBTC ledger to get balance
+    let ledger_id = Principal::from_text(CKBTC_LEDGER_CANISTER_ID)
+        .map_err(|e| format!("Invalid ckBTC ledger canister id: {}", e))?;
+
+    let account = Icrc1Account {
+        owner: vault.owner,
+        subaccount: vault.ckbtc_subaccount.clone(),
+    };
+
+    // Call icrc1_balance_of : (record { owner; subaccount }) -> (nat)
+    let (balance_nat,): (Nat,) = ic_cdk::call(
+        ledger_id,
+        "icrc1_balance_of",
+        (account,),
+    )
+    .await
+    .map_err(|e| format!("Failed to call ckBTC ledger: {}", e.1))?;
+
+    // Convert Nat to u64 safely
+    let synced_balance: u64 = balance_nat
+        .0
+        .try_into()
+        .map_err(|_| "ckBTC balance is too large to fit in u64".to_string())?;
+
+    // Update vault balance in state
+    let updated_vault = with_state_mut(|state| {
+        if let Some(v) = state
+            .vaults
+            .iter_mut()
+            .find(|v| v.id == vault_id && v.owner == caller)
+        {
+            v.balance = synced_balance;
+            v.updated_at = now_sec();
+            Some(v.clone())
+        } else {
+            None
+        }
+    })
+    .ok_or_else(|| "Vault not found or unauthorized".to_string())?;
+
+    Ok(CkbtcSyncResult {
+        vault: updated_vault,
+        synced_balance,
+        mode,
+    })
+}
+
+// =======================
+// Bitcoin Proof Endpoints (Placeholder)
+// =======================
+
+/// Get proof of deposit transaction (placeholder for Bitcoin API integration)
+#[query]
+async fn get_deposit_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
+    let caller = msg_caller();
+
+    let vault = with_state(|state| {
+        state
+            .vaults
+            .iter()
+            .find(|v| v.id == vault_id && v.owner == caller)
+            .cloned()
+    });
+
+    let vault = match vault {
+        Some(v) => v,
+        None => return Err("Vault not found or unauthorized".to_string()),
+    };
+
+    let txid = match &vault.btc_deposit_txid {
+        Some(t) => t.clone(),
+        None => return Err("No deposit txid recorded for this vault".to_string()),
+    };
+
+    // TODO: integrate with ICP Bitcoin canister.
+    // For now, return a dummy "unconfirmed" proof.
+    Ok(BitcoinTxProof {
+        txid,
+        confirmed: false,
+        confirmations: 0,
+    })
+}
+
+/// Get proof of withdrawal transaction (placeholder for Bitcoin API integration)
+#[query]
+async fn get_withdraw_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
+    let caller = msg_caller();
+
+    let vault = with_state(|state| {
+        state
+            .vaults
+            .iter()
+            .find(|v| v.id == vault_id && v.owner == caller)
+            .cloned()
+    });
+
+    let vault = match vault {
+        Some(v) => v,
+        None => return Err("Vault not found or unauthorized".to_string()),
+    };
+
+    let txid = match &vault.btc_withdraw_txid {
+        Some(t) => t.clone(),
+        None => return Err("No withdraw txid recorded for this vault".to_string()),
+    };
+
+    // TODO: integrate with ICP Bitcoin canister.
+    Ok(BitcoinTxProof {
+        txid,
+        confirmed: false,
+        confirmations: 0,
+    })
+}
+
+// =======================
+// Threshold Signing (Placeholder)
+// =======================
+
+/// Request BTC signature using threshold ECDSA (real integration)
+#[update]
+async fn request_btc_signature(vault_id: u64, message: Vec<u8>) -> Result<SignatureResponse, String> {
+    let caller = msg_caller();
+
+    let owns = with_state(|state| {
+        state
+            .vaults
+            .iter()
+            .any(|v| v.id == vault_id && v.owner == caller)
+    });
+
+    if !owns {
+        return Err("Vault not found or unauthorized".to_string());
+    }
+
+    // Validate message is not empty
+    if message.is_empty() {
+        return Err("Message must not be empty".to_string());
+    }
+
+    // Hash the message with SHA-256
+    let mut hasher = Sha256::new();
+    hasher.update(&message);
+    let hash = hasher.finalize();
+    let message_hash = hash.to_vec();
+
+    // Build ECDSA signing argument
+    let arg = SignWithEcdsaArgument {
+        message_hash,
+        derivation_path: vec![], // single key for now; can extend later
+        key_id: ecdsa_key_id(),
+    };
+
+    // Call management canister to sign (canister ID aaaaa-aa)
+    // ECDSA signing requires ~26.2B cycles per signature
+    let mgmt_canister = Principal::from_text("aaaaa-aa").unwrap();
+    let cycles: u128 = 30_000_000_000; // 30 billion cycles (buffer for safety)
+    
+    let (resp,): (SignWithEcdsaResponse,) = ic_cdk::api::call::call_with_payment128(
+        mgmt_canister,
+        "sign_with_ecdsa",
+        (arg,),
+        cycles,
+    )
+    .await
+    .map_err(|e| format!("Failed to sign with ECDSA: {}", e.1))?;
+
+    // Extract signature from response
+    let signature = resp.signature;
+
+    Ok(SignatureResponse { message, signature })
 }
 
 // Export Candid interface

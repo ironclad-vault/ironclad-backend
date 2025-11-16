@@ -1,3 +1,8 @@
+type NetworkMode = variant {
+    Mock;
+    CkBTCMainnet;
+};
+
 type VaultStatus = variant {
     PendingDeposit;
     ActiveLocked;
@@ -9,6 +14,7 @@ type Vault = record {
     id: nat64;
     owner: principal;
     btc_address: text;
+    ckbtc_subaccount: opt blob;
     expected_deposit: nat64;
     btc_deposit_txid: opt text;
     btc_withdraw_txid: opt text;
@@ -70,6 +76,23 @@ type MarketListing = record {
     updated_at: nat64;
 };
 
+type CkbtcSyncResult = record {
+    vault: Vault;
+    synced_balance: nat64;
+    mode: NetworkMode;
+};
+
+type BitcoinTxProof = record {
+    txid: text;
+    confirmed: bool;
+    confirmations: nat32;
+};
+
+type SignatureResponse = record {
+    message: blob;
+    signature: blob;
+};
+
 service : {
     create_vault: (nat64, nat64) -> (Vault);
     get_my_vaults: () -> (vec Vault) query;
@@ -94,4 +117,11 @@ service : {
     get_active_listings: () -> (vec MarketListing) query;
     get_my_listings: () -> (vec MarketListing) query;
     buy_listing: (nat64) -> (variant { Ok: Vault; Err: text });
+    set_mode_mock: () -> ();
+    set_mode_ckbtc_mainnet: () -> ();
+    get_mode_query: () -> (NetworkMode) query;
+    sync_vault_balance_from_ckbtc: (nat64) -> (variant { Ok: CkbtcSyncResult; Err: text });
+    get_deposit_proof: (nat64) -> (variant { Ok: BitcoinTxProof; Err: text }) query;
+    get_withdraw_proof: (nat64) -> (variant { Ok: BitcoinTxProof; Err: text }) query;
+    request_btc_signature: (nat64, blob) -> (variant { Ok: SignatureResponse; Err: text });
 }
