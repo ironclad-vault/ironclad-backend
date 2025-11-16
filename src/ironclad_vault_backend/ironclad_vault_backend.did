@@ -26,6 +26,13 @@ type VaultEvent = record {
     notes: text;
 };
 
+type AutoReinvestPlanStatus = variant {
+    Active;
+    Cancelled;
+    Error;
+    Paused;
+};
+
 type AutoReinvestConfig = record {
     vault_id: nat64;
     owner: principal;
@@ -33,6 +40,17 @@ type AutoReinvestConfig = record {
     enabled: bool;
     created_at: nat64;
     updated_at: nat64;
+    plan_status: AutoReinvestPlanStatus;
+    error_message: opt text;
+    next_cycle_timestamp: nat64;
+    execution_count: nat64;
+};
+
+type PlanStatusResponse = record {
+    plan_status: AutoReinvestPlanStatus;
+    error_message: opt text;
+    next_cycle_timestamp: nat64;
+    execution_count: nat64;
 };
 
 type ListingStatus = variant {
@@ -69,6 +87,8 @@ service : {
     get_auto_reinvest_config: (nat64) -> (opt AutoReinvestConfig) query;
     get_my_auto_reinvest_configs: () -> (vec AutoReinvestConfig) query;
     execute_auto_reinvest: (nat64) -> (variant { Ok: Vault; Err: text });
+    get_plan_status: (nat64) -> (variant { Ok: PlanStatusResponse; Err: text }) query;
+    retry_failed_plan: (nat64) -> (variant { Ok: AutoReinvestConfig; Err: text });
     create_listing: (nat64, nat64) -> (variant { Ok: MarketListing; Err: text });
     cancel_listing: (nat64) -> (variant { Ok: MarketListing; Err: text });
     get_active_listings: () -> (vec MarketListing) query;

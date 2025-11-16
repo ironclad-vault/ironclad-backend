@@ -47,6 +47,14 @@ pub struct VaultEvent {
 }
 
 #[derive(Clone, CandidType, Deserialize)]
+pub enum AutoReinvestPlanStatus {
+    Active,
+    Cancelled,
+    Error,
+    Paused,
+}
+
+#[derive(Clone, CandidType, Deserialize)]
 pub struct AutoReinvestConfig {
     pub vault_id: u64,
     pub owner: Principal,
@@ -54,6 +62,18 @@ pub struct AutoReinvestConfig {
     pub enabled: bool,
     pub created_at: u64,
     pub updated_at: u64,
+    pub plan_status: AutoReinvestPlanStatus,
+    pub error_message: Option<String>,
+    pub next_cycle_timestamp: u64,
+    pub execution_count: u64,
+}
+
+#[derive(Clone, CandidType, Deserialize)]
+pub struct PlanStatusResponse {
+    pub plan_status: AutoReinvestPlanStatus,
+    pub error_message: Option<String>,
+    pub next_cycle_timestamp: u64,
+    pub execution_count: u64,
 }
 
 #[derive(Clone, CandidType, Deserialize)]
@@ -483,6 +503,9 @@ fn schedule_auto_reinvest(vault_id: u64, new_lock_duration: u64) -> Result<AutoR
             existing.new_lock_duration = new_lock_duration;
             existing.enabled = true;
             existing.updated_at = ts;
+            existing.plan_status = AutoReinvestPlanStatus::Active;
+            existing.error_message = None;
+            existing.next_cycle_timestamp = ts + new_lock_duration;
             Ok(existing.clone())
         } else {
             // Create new config
@@ -493,6 +516,10 @@ fn schedule_auto_reinvest(vault_id: u64, new_lock_duration: u64) -> Result<AutoR
                 enabled: true,
                 created_at: ts,
                 updated_at: ts,
+                plan_status: AutoReinvestPlanStatus::Active,
+                error_message: None,
+                next_cycle_timestamp: ts + new_lock_duration,
+                execution_count: 0,
             };
             state.auto_reinvest.push(config.clone());
             Ok(config)
@@ -527,9 +554,12 @@ fn cancel_auto_reinvest(vault_id: u64) -> Result<(), String> {
             None => return Err("No active auto-reinvest config for this vault or unauthorized".to_string()),
         };
 
-        // Disable config
+        // Disable config and update status
         config.enabled = false;
         config.updated_at = ts;
+        config.plan_status = AutoReinvestPlanStatus::Cancelled;
+        config.error_message = None;
+        config.next_cycle_timestamp = 0;
         Ok(())
     });
 
@@ -576,6 +606,18 @@ fn get_my_auto_reinvest_configs() -> Vec<AutoReinvestConfig> {
 fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
     let caller = msg_caller();
     let ts = now_sec();
+
+    // First validate that config exists
+    let config_exists = with_state(|state| {
+        state
+            .auto_reinvest
+            .iter()
+            .any(|c| c.vault_id == vault_id && c.owner == caller && c.enabled)
+    });
+
+    if !config_exists {
+        return Err("No active auto-reinvest config for this vault or unauthorized".to_string());
+    }
 
     let result = with_state_mut(|state| {
         // Find active auto-reinvest config
@@ -633,29 +675,117 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
 
         state.vaults.push(new_vault.clone());
 
-        // Disable the auto-reinvest config
+        // Update the auto-reinvest config - keep it Active and increment counter
         if let Some(cfg) = state
             .auto_reinvest
             .iter_mut()
             .find(|c| c.vault_id == vault_id && c.owner == caller)
         {
-            cfg.enabled = false;
+            cfg.execution_count += 1;
+            cfg.plan_status = AutoReinvestPlanStatus::Active;
+            cfg.error_message = None;
+            cfg.next_cycle_timestamp = ts + cfg.new_lock_duration;
             cfg.updated_at = ts;
         }
 
         Ok(new_vault)
     });
 
-    if let Ok(ref new_vault) = result {
+    match &result {
+        Ok(new_vault) => {
+            record_event(
+                vault_id,
+                "AUTO_REINVEST_EXECUTED_SOURCE",
+                &format!("Source vault withdrawn for reinvestment"),
+            );
+            record_event(
+                new_vault.id,
+                "AUTO_REINVEST_EXECUTED_TARGET",
+                &format!("New vault created from auto-reinvest with balance {}", new_vault.balance),
+            );
+        }
+        Err(error_msg) => {
+            // Set error status on the config
+            with_state_mut(|state| {
+                if let Some(cfg) = state
+                    .auto_reinvest
+                    .iter_mut()
+                    .find(|c| c.vault_id == vault_id && c.owner == caller)
+                {
+                    cfg.plan_status = AutoReinvestPlanStatus::Error;
+                    cfg.error_message = Some(error_msg.clone());
+                    cfg.updated_at = ts;
+                }
+            });
+            record_event(
+                vault_id,
+                "AUTO_REINVEST_ERROR",
+                &format!("Auto-reinvest failed: {}", error_msg),
+            );
+        }
+    }
+
+    result
+}
+
+/// Get plan status for a vault's auto-reinvest configuration.
+#[query]
+fn get_plan_status(vault_id: u64) -> Result<PlanStatusResponse, String> {
+    let caller = msg_caller();
+    with_state(|state| {
+        let config = match state
+            .auto_reinvest
+            .iter()
+            .find(|c| c.vault_id == vault_id && c.owner == caller)
+        {
+            Some(c) => c,
+            None => return Err("No auto-reinvest config found for this vault or unauthorized".to_string()),
+        };
+
+        Ok(PlanStatusResponse {
+            plan_status: config.plan_status.clone(),
+            error_message: config.error_message.clone(),
+            next_cycle_timestamp: config.next_cycle_timestamp,
+            execution_count: config.execution_count,
+        })
+    })
+}
+
+/// Retry a failed auto-reinvest plan.
+#[update]
+fn retry_failed_plan(vault_id: u64) -> Result<AutoReinvestConfig, String> {
+    let caller = msg_caller();
+    let ts = now_sec();
+
+    let result = with_state_mut(|state| {
+        let config = match state
+            .auto_reinvest
+            .iter_mut()
+            .find(|c| c.vault_id == vault_id && c.owner == caller)
+        {
+            Some(c) => c,
+            None => return Err("No auto-reinvest config found for this vault or unauthorized".to_string()),
+        };
+
+        // Validate plan is in Error state
+        if !matches!(config.plan_status, AutoReinvestPlanStatus::Error) {
+            return Err("Plan must be in Error state to retry".to_string());
+        }
+
+        // Reset to Active status
+        config.plan_status = AutoReinvestPlanStatus::Active;
+        config.error_message = None;
+        config.next_cycle_timestamp = ts + config.new_lock_duration;
+        config.updated_at = ts;
+
+        Ok(config.clone())
+    });
+
+    if let Ok(ref _config) = result {
         record_event(
             vault_id,
-            "AUTO_REINVEST_EXECUTED_SOURCE",
-            &format!("Source vault withdrawn for reinvestment"),
-        );
-        record_event(
-            new_vault.id,
-            "AUTO_REINVEST_EXECUTED_TARGET",
-            &format!("New vault created from auto-reinvest with balance {}", new_vault.balance),
+            "AUTO_REINVEST_RETRY",
+            "Auto-reinvest plan reset to Active after error",
         );
     }
 
