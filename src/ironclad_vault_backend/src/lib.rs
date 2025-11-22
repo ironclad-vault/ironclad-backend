@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 // ckBTC / ckTESTBTC ledger canister IDs (from official ICP docs)
 // Mainnet ckBTC ledger:      mxzaz-hqaaa-aaaar-qaada-cai
 // Testnet4 ckTESTBTC ledger: g4xu7-jiaaa-aaaan-aaaaq-cai
-const CKBTC_LEDGER_CANISTER_ID: &str = "g4xu7-jiaaa-aaaan-aaaaq-cai";
-// NOTE: swap to mxzaz-hqaaa-aaaar-qaada-cai when pointing to mainnet ckBTC.
+// LOCAL development (dfx replica): mxzaz-hqaaa-aaaar-qaada-cai (using mainnet ID for local deploy)
+const CKBTC_LEDGER_CANISTER_ID: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+// NOTE: This uses the mainnet ID locally because dfx lets us deploy to any ID. Switch only if deploying to actual testnet.
 
 // Local dfx mock ledger (will be set during init)
 thread_local! {
@@ -70,7 +71,7 @@ pub enum NetworkMode {
     CkBTCMainnet,
 }
 
-#[derive(Clone, CandidType, Deserialize)]
+#[derive(Clone, Debug, CandidType, Deserialize)]
 pub enum VaultStatus {
     PendingDeposit,
     ActiveLocked,
@@ -1437,6 +1438,7 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     };
 
     // Call icrc1_balance_of : (record { owner; subaccount }) -> (nat)
+    #[allow(deprecated)]
     let balance_result = ic_cdk::call(ledger_id, "icrc1_balance_of", (account,)).await;
 
     // Handle the call result with helpful error messages for local development
@@ -1467,14 +1469,52 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     // Update vault balance in state using helper
     let updated_vault = with_state_mut(|state| {
         if let Some(v) = _get_vault_mut(state, vault_id, caller) {
+            let old_status = format!("{:?}", v.status);
+            let old_balance = v.balance;
+            
             v.balance = synced_balance;
             v.updated_at = now_sec();
+            
+            // CRITICAL FIX: Update status to ActiveLocked if deposit was successful
+            // Only transition from PendingDeposit to ActiveLocked if balance is now > 0
+            if matches!(v.status, VaultStatus::PendingDeposit) && synced_balance > 0 {
+                ic_cdk::api::debug_print(format!(
+                    "[SYNC] Status update: {:?} -> ActiveLocked (balance: {} -> {})",
+                    old_status, old_balance, synced_balance
+                ));
+                v.status = VaultStatus::ActiveLocked;
+            } else {
+                ic_cdk::api::debug_print(format!(
+                    "[SYNC] No status update: status={:?}, synced_balance={}, condition_met={}",
+                    old_status,
+                    synced_balance,
+                    matches!(v.status, VaultStatus::PendingDeposit) && synced_balance > 0
+                ));
+            }
+            
             Some(v.clone())
         } else {
+            ic_cdk::api::debug_print(format!("[SYNC] Vault not found: vault_id={}", vault_id));
             None
         }
     })
     .ok_or_else(|| "Vault not found or unauthorized".to_string())?;
+
+    // Record events for audit trail
+    record_event(
+        vault_id,
+        "CKBTC_DEPOSIT_CONFIRMED",
+        &format!("ckBTC deposit confirmed - synced {} satoshis from ledger", synced_balance),
+    );
+    
+    // Record status transition if it occurred
+    if synced_balance > 0 && matches!(updated_vault.status, VaultStatus::ActiveLocked) {
+        record_event(
+            vault_id,
+            "LOCK_STARTED",
+            "Vault moved to ActiveLocked after ckBTC deposit confirmation",
+        );
+    }
 
     Ok(CkbtcSyncResult {
         vault: updated_vault,
@@ -1661,6 +1701,7 @@ async fn request_btc_signature(
     let mgmt_canister = Principal::from_text("aaaaa-aa").unwrap();
     let cycles: u128 = 30_000_000_000; // 30 billion cycles (buffer for safety)
 
+    #[allow(deprecated)]
     let (resp,): (SignWithEcdsaResponse,) =
         ic_cdk::api::call::call_with_payment128(mgmt_canister, "sign_with_ecdsa", (arg,), cycles)
             .await
