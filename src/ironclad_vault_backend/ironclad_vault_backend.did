@@ -98,7 +98,7 @@ type SignatureResponse = record {
 };
 
 service : {
-    create_vault: (nat64, nat64, opt principal, opt text) -> (Vault);
+    create_vault: (nat64, nat64, opt principal, opt text, opt text) -> (Vault);
     get_my_vaults: () -> (vec Vault) query;
     get_vault: (nat64) -> (opt Vault) query;
     get_vault_events: (nat64) -> (vec VaultEvent) query;
