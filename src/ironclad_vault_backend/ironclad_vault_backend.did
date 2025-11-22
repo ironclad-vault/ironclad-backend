@@ -107,7 +107,7 @@ service : {
     unlock_vault: (nat64) -> (variant { Ok: Vault; Err: text });
     get_unlockable_vaults: () -> (vec Vault) query;
     preview_withdraw: (nat64) -> (variant { Ok: nat64; Err: text }) query;
-    withdraw_vault: (nat64, nat64) -> (variant { Ok: Vault; Err: text });
+    withdraw_vault: (nat64) -> (variant { Ok: Vault; Err: text });
     get_withdrawable_vaults: () -> (vec Vault) query;
     schedule_auto_reinvest: (nat64, nat64) -> (variant { Ok: AutoReinvestConfig; Err: text });
     cancel_auto_reinvest: (nat64) -> (variant { Ok: null; Err: text });

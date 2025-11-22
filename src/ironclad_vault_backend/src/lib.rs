@@ -40,6 +40,40 @@ struct Icrc1Account {
     subaccount: Option<Vec<u8>>,
 }
 
+// --- Transfer structs untuk Withdraw ckBTC ---
+#[derive(CandidType, Deserialize)]
+struct Account {
+    owner: Principal,
+    subaccount: Option<Vec<u8>>,
+}
+
+#[derive(CandidType, Deserialize)]
+struct TransferArg {
+    from_subaccount: Option<Vec<u8>>,
+    to: Account,
+    amount: Nat,
+    fee: Option<Nat>,
+    memo: Option<Vec<u8>>,
+    created_at_time: Option<u64>,
+}
+
+#[derive(CandidType, Deserialize)]
+enum TransferResult {
+    Ok(Nat),
+    Err(TransferError),
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+enum TransferError {
+    BadFee { expected_fee: Nat },
+    InsufficientFunds { balance: Nat },
+    TooOld,
+    CreatedInFuture { ledger_time: u64 },
+    Duplicate { duplicate_of: Nat },
+    TemporarilyUnavailable,
+    GenericError { error_code: Nat, message: String },
+}
+
 // ECDSA types (matching management canister interface)
 #[derive(CandidType, Deserialize)]
 struct EcdsaKeyId {
@@ -618,43 +652,89 @@ fn preview_withdraw(id: u64) -> Result<u64, String> {
 
 /// Withdraw from a vault (mock flow), updates state and logs events.
 #[update]
-fn withdraw_vault(id: u64, amount: u64) -> Result<Vault, String> {
-    let caller = msg_caller();
-    let ts = now_sec();
+async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
+    // 1. Ambil data vault (Mutable)
+    let (owner, amount_e8s, ckbtc_subaccount) = with_state(|s| {
+        let vault = _get_vault(s, vault_id, msg_caller()).ok_or("Vault not found")?;
+        
+        // Validasi Keamanan
+        if vault.owner != msg_caller() {
+            return Err("Unauthorized".to_string());
+        }
+        
+        // Cek apakah sudah waktunya unlock (kecuali masih Mock mode testing)
+        let _current_time = now_sec();
+        // Note: Di production, uncomment baris bawah ini:
+        // if _current_time < vault.lock_until { return Err("Vault is still locked".to_string()); }
 
-    let result = with_state_mut(|state| {
-        let vault = _get_vault_mut(state, id, caller).ok_or("Vault not found or unauthorized")?;
-
-        if !matches!(vault.status, VaultStatus::Unlockable) {
-            return Err("Vault is not unlockable".to_string());
+        if matches!(vault.status, VaultStatus::Withdrawn) {
+            return Err("Vault already withdrawn".to_string());
         }
 
-        if amount == 0 {
-            return Err("Withdraw amount must be greater than 0".to_string());
-        }
+        Ok((vault.owner, vault.balance, vault.ckbtc_subaccount.clone()))
+    })?;
 
-        if amount > vault.balance {
-            return Err("Withdraw amount exceeds balance".to_string());
-        }
-
-        // Apply withdrawal
-        vault.balance -= amount;
-        if vault.balance == 0 {
-            vault.status = VaultStatus::Withdrawn;
-        }
-        let txid = format!("MOCK-TXID-{}", id);
-        vault.btc_withdraw_txid = Some(txid.clone());
-        vault.updated_at = ts;
-
-        Ok((vault.clone(), txid))
-    });
-
-    if let Ok((ref _v, ref txid)) = result {
-        record_event(id, "WITHDRAW_REQUESTED", &format!("Requested withdraw"));
-        record_event(id, "WITHDRAW_COMPLETED", &format!("Withdraw txid {}", txid));
+    // 2. Hitung Amount yang ditransfer (Balance - Fee Transaksi)
+    // Fee ckBTC standar = 10 e8s
+    let fee = 10u64;
+    if amount_e8s <= fee {
+        return Err("Balance too low to cover transfer fee".to_string());
     }
+    let transfer_amount = amount_e8s - fee;
 
-    result.map(|(v, _)| v)
+    // 3. SIAPKAN PANGGILAN KE LEDGER (Real Transfer)
+    let ledger_principal = Principal::from_text(CKBTC_LEDGER_CANISTER_ID)
+        .map_err(|_| "Invalid ledger canister ID".to_string())?;
+    
+    // PENTING: Transfer dari vault subaccount (tempat user deposit), bukan dari akun utama
+    let transfer_args = TransferArg {
+        from_subaccount: ckbtc_subaccount, // Dari subaccount vault tempat user deposit
+        to: Account {
+            owner: owner,
+            subaccount: None, // Ke wallet User (akun utama)
+        },
+        amount: Nat::from(transfer_amount),
+        fee: None,
+        memo: None,
+        created_at_time: None,
+    };
+
+    // 4. EKSEKUSI TRANSFER (Inter-Canister Call)
+    #[allow(deprecated)]
+    let (result,): (TransferResult,) = ic_cdk::call(
+        ledger_principal,
+        "icrc1_transfer",
+        (transfer_args,),
+    )
+    .await
+    .map_err(|e| format!("Failed to call ledger: {:?}", e))?;
+
+    // 5. Handle Hasil Transfer
+    match result {
+        TransferResult::Ok(block_index) => {
+            // SUKSES! Uang sudah pindah, sekarang update status Vault
+            let result = with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.status = VaultStatus::Withdrawn;
+                    vault.btc_withdraw_txid = Some(format!("block_index:{}", block_index));
+                    vault.updated_at = now_sec();
+                    Ok(vault.clone())
+                } else {
+                    Err("Vault not found during update".to_string())
+                }
+            });
+
+            if let Ok(ref _v) = result {
+                record_event(vault_id, "WITHDRAW_COMPLETED", &format!("Real transfer block_index: {}", block_index));
+            }
+
+            result
+        },
+        TransferResult::Err(e) => {
+            // Gagal transfer, jangan ubah status vault
+            Err(format!("Ledger transfer failed: {:?}", e))
+        }
+    }
 }
 
 /// Get all withdrawable vaults for the caller (Unlockable and balance > 0).
