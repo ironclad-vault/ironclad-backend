@@ -1,6 +1,7 @@
 // src/ironclad_vault_backend/src/lib.rs
 
 use candid::{CandidType, Deserialize, Nat, Principal};
+use hex;
 use ic_cdk::api::{msg_caller, time};
 use ic_cdk_macros::{init, query, update};
 use sha2::{Digest, Sha256};
@@ -79,20 +80,23 @@ pub struct Vault {
 
     // BTC / ckBTC routing
     pub btc_address: String,
-    pub ckbtc_subaccount: Option<Vec<u8>>,  // NEW: ckBTC subaccount for this vault
-    pub expected_deposit: u64,          // in satoshis (can be 0 for now)
+    pub ckbtc_subaccount: Option<Vec<u8>>, // NEW: ckBTC subaccount for this vault
+    pub expected_deposit: u64,             // in satoshis (can be 0 for now)
     pub btc_deposit_txid: Option<String>,
     pub btc_withdraw_txid: Option<String>,
 
     // Timelock & balance
-    pub lock_until: u64,                // unix timestamp (seconds)
+    pub lock_until: u64, // unix timestamp (seconds)
     pub status: VaultStatus,
-    pub balance: u64,                   // current balance (dummy / real later)
+    pub balance: u64, // current balance (dummy / real later)
 
     // === INHERITANCE PROTOCOL (Dead Man Switch) ===
-    pub beneficiary: Option<Principal>,  // designated heir
-    pub last_keep_alive: u64,            // timestamp of last owner activity
-    pub inheritance_timeout: u64,        // seconds of inactivity before claim (default: 180 days)
+    pub beneficiary: Option<Principal>, // designated heir
+    pub last_keep_alive: u64,           // timestamp of last owner activity
+    pub inheritance_timeout: u64,       // seconds of inactivity before claim (default: 180 days)
+
+    // === DIGITAL WILL (Encrypted Message) ===
+    pub encrypted_note: Option<String>, // Hex-encoded ciphertext for Digital Will
 
     // Metadata
     pub created_at: u64,
@@ -102,7 +106,7 @@ pub struct Vault {
 #[derive(Clone, CandidType, Deserialize)]
 pub struct VaultEvent {
     pub vault_id: u64,
-    pub action: String,                 // e.g. "VAULT_CREATED", "MOCK_DEPOSIT"
+    pub action: String, // e.g. "VAULT_CREATED", "MOCK_DEPOSIT"
     pub timestamp: u64,
     pub notes: String,
 }
@@ -250,10 +254,15 @@ fn init() {
 // Public methods
 // =======================
 
-/// Create a new vault with a lock_until time, optional expected_deposit, and optional beneficiary.
+/// Create a new vault with a lock_until time, optional expected_deposit, optional beneficiary, and optional encrypted Digital Will note.
 /// For now btc_address is a placeholder string; later we'll plug real BTC.
 #[update]
-fn create_vault(lock_until: u64, expected_deposit: u64, beneficiary: Option<Principal>) -> Vault {
+fn create_vault(
+    lock_until: u64,
+    expected_deposit: u64,
+    beneficiary: Option<Principal>,
+    encrypted_note: Option<String>,
+) -> Vault {
     let caller = msg_caller();
     let ts = now_sec();
 
@@ -279,9 +288,10 @@ fn create_vault(lock_until: u64, expected_deposit: u64, beneficiary: Option<Prin
             lock_until,
             status: VaultStatus::PendingDeposit,
             balance: 0,
-            beneficiary,                                      // Set from argument
-            last_keep_alive: ts,                              // Initialize to now
-            inheritance_timeout: 15_552_000,                  // Default 180 days (6 months) in seconds
+            beneficiary,                     // Set from argument
+            last_keep_alive: ts,             // Initialize to now
+            inheritance_timeout: 15_552_000, // Default 180 days (6 months) in seconds
+            encrypted_note,                  // Digital Will encrypted message
             created_at: ts,
             updated_at: ts,
         };
@@ -290,7 +300,11 @@ fn create_vault(lock_until: u64, expected_deposit: u64, beneficiary: Option<Prin
         vault
     });
 
-    record_event(vault.id, "VAULT_CREATED", "Vault created in PendingDeposit state");
+    record_event(
+        vault.id,
+        "VAULT_CREATED",
+        "Vault created in PendingDeposit state",
+    );
     vault
 }
 
@@ -327,10 +341,7 @@ fn get_vault_events(id: u64) -> Vec<VaultEvent> {
     let caller = msg_caller();
     with_state(|state| {
         // Ensure caller owns the vault before showing history
-        let owns = state
-            .vaults
-            .iter()
-            .any(|v| v.id == id && v.owner == caller);
+        let owns = state.vaults.iter().any(|v| v.id == id && v.owner == caller);
 
         if !owns {
             return Vec::new();
@@ -355,11 +366,7 @@ fn mock_deposit_vault(id: u64, amount: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = match state
-            .vaults
-            .iter_mut()
-            .find(|v| v.id == id)
-        {
+        let vault = match state.vaults.iter_mut().find(|v| v.id == id) {
             Some(v) if v.owner == caller => v,
             Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
             None => return Err("Vault not found".to_string()),
@@ -395,11 +402,7 @@ fn is_vault_unlockable(id: u64) -> Result<bool, String> {
     let now = now_sec();
 
     with_state(|state| {
-        let vault = match state
-            .vaults
-            .iter()
-            .find(|v| v.id == id)
-        {
+        let vault = match state.vaults.iter().find(|v| v.id == id) {
             Some(v) if v.owner == caller => v,
             Some(_) => return Err("Vault not found or unauthorized".to_string()),
             None => return Err("Vault not found or unauthorized".to_string()),
@@ -419,11 +422,7 @@ fn unlock_vault(id: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = match state
-            .vaults
-            .iter_mut()
-            .find(|v| v.id == id)
-        {
+        let vault = match state.vaults.iter_mut().find(|v| v.id == id) {
             Some(v) if v.owner == caller => v,
             Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
             None => return Err("Vault not found".to_string()),
@@ -442,15 +441,9 @@ fn unlock_vault(id: u64) -> Result<Vault, String> {
                 vault.updated_at = ts;
                 Ok(vault.clone())
             }
-            VaultStatus::Unlockable => {
-                Err("Vault is already unlocked".to_string())
-            }
-            VaultStatus::PendingDeposit => {
-                Err("Vault must be locked before unlocking".to_string())
-            }
-            VaultStatus::Withdrawn => {
-                Err("Vault has already been withdrawn".to_string())
-            }
+            VaultStatus::Unlockable => Err("Vault is already unlocked".to_string()),
+            VaultStatus::PendingDeposit => Err("Vault must be locked before unlocking".to_string()),
+            VaultStatus::Withdrawn => Err("Vault has already been withdrawn".to_string()),
         }
     });
 
@@ -560,7 +553,9 @@ fn get_withdrawable_vaults() -> Vec<Vault> {
         state
             .vaults
             .iter()
-            .filter(|v| v.owner == caller && matches!(v.status, VaultStatus::Unlockable) && v.balance > 0)
+            .filter(|v| {
+                v.owner == caller && matches!(v.status, VaultStatus::Unlockable) && v.balance > 0
+            })
             .cloned()
             .collect()
     })
@@ -576,15 +571,18 @@ fn get_withdrawable_vaults() -> Vec<Vault> {
 fn ping_alive(vault_id: u64) -> Result<Vault, String> {
     let caller = msg_caller();
     let ts = now_sec();
-    
+
     let result = with_state_mut(|state| {
-        let vault = state.vaults.iter_mut().find(|v| v.id == vault_id)
+        let vault = state
+            .vaults
+            .iter_mut()
+            .find(|v| v.id == vault_id)
             .ok_or("Vault not found")?;
-            
+
         if vault.owner != caller {
             return Err("Unauthorized".to_string());
         }
-        
+
         vault.last_keep_alive = ts; // Reset timer
         vault.updated_at = ts;
         Ok(vault.clone())
@@ -607,27 +605,30 @@ fn ping_alive(vault_id: u64) -> Result<Vault, String> {
 fn claim_inheritance(vault_id: u64) -> Result<Vault, String> {
     let caller = msg_caller();
     let ts = now_sec();
-    
+
     let result = with_state_mut(|state| {
-        let vault = state.vaults.iter_mut().find(|v| v.id == vault_id)
+        let vault = state
+            .vaults
+            .iter_mut()
+            .find(|v| v.id == vault_id)
             .ok_or("Vault not found")?;
-            
+
         if vault.beneficiary != Some(caller) {
             return Err("Not the beneficiary".to_string());
         }
-        
+
         // Check timeout (Dead Man Switch)
         if ts < vault.last_keep_alive + vault.inheritance_timeout {
             return Err("Owner is still considered active".to_string());
         }
-        
+
         // Transfer ownership
         let old_owner = vault.owner;
         vault.owner = caller;
         vault.beneficiary = None; // Reset beneficiary
         vault.last_keep_alive = ts;
         vault.updated_at = ts;
-        
+
         Ok((vault.clone(), old_owner))
     });
 
@@ -635,7 +636,10 @@ fn claim_inheritance(vault_id: u64) -> Result<Vault, String> {
         record_event(
             vault_id,
             "INHERITANCE_CLAIMED",
-            &format!("Vault ownership transferred from {} to beneficiary via inheritance", old_owner),
+            &format!(
+                "Vault ownership transferred from {} to beneficiary via inheritance",
+                old_owner
+            ),
         );
     }
 
@@ -648,7 +652,10 @@ fn claim_inheritance(vault_id: u64) -> Result<Vault, String> {
 
 /// Schedule auto-reinvest for a vault with a new lock duration.
 #[update]
-fn schedule_auto_reinvest(vault_id: u64, new_lock_duration: u64) -> Result<AutoReinvestConfig, String> {
+fn schedule_auto_reinvest(
+    vault_id: u64,
+    new_lock_duration: u64,
+) -> Result<AutoReinvestConfig, String> {
     let caller = msg_caller();
     let ts = now_sec();
 
@@ -707,7 +714,10 @@ fn schedule_auto_reinvest(vault_id: u64, new_lock_duration: u64) -> Result<AutoR
         record_event(
             vault_id,
             "AUTO_REINVEST_SCHEDULED",
-            &format!("Auto-reinvest scheduled with lock duration {} seconds", new_lock_duration),
+            &format!(
+                "Auto-reinvest scheduled with lock duration {} seconds",
+                new_lock_duration
+            ),
         );
     }
 
@@ -728,7 +738,11 @@ fn cancel_auto_reinvest(vault_id: u64) -> Result<(), String> {
             .find(|c| c.vault_id == vault_id && c.owner == caller && c.enabled)
         {
             Some(c) => c,
-            None => return Err("No active auto-reinvest config for this vault or unauthorized".to_string()),
+            None => {
+                return Err(
+                    "No active auto-reinvest config for this vault or unauthorized".to_string(),
+                )
+            }
         };
 
         // Disable config and update status
@@ -804,7 +818,11 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             .find(|c| c.vault_id == vault_id && c.owner == caller && c.enabled)
         {
             Some(c) => c.clone(),
-            None => return Err("No active auto-reinvest config for this vault or unauthorized".to_string()),
+            None => {
+                return Err(
+                    "No active auto-reinvest config for this vault or unauthorized".to_string(),
+                )
+            }
         };
 
         // Find source vault
@@ -851,9 +869,10 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             lock_until: ts + config.new_lock_duration,
             status: VaultStatus::ActiveLocked,
             balance: old_balance,
-            beneficiary: None,                    // No beneficiary for auto-reinvested vaults
-            last_keep_alive: ts,                  // Initialize to now
-            inheritance_timeout: 15_552_000,      // Default 180 days
+            beneficiary: None,   // No beneficiary for auto-reinvested vaults
+            last_keep_alive: ts, // Initialize to now
+            inheritance_timeout: 15_552_000, // Default 180 days
+            encrypted_note: None, // No Digital Will for auto-created vaults
             created_at: ts,
             updated_at: ts,
         };
@@ -886,7 +905,10 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             record_event(
                 new_vault.id,
                 "AUTO_REINVEST_EXECUTED_TARGET",
-                &format!("New vault created from auto-reinvest with balance {}", new_vault.balance),
+                &format!(
+                    "New vault created from auto-reinvest with balance {}",
+                    new_vault.balance
+                ),
             );
         }
         Err(error_msg) => {
@@ -924,7 +946,11 @@ fn get_plan_status(vault_id: u64) -> Result<PlanStatusResponse, String> {
             .find(|c| c.vault_id == vault_id && c.owner == caller)
         {
             Some(c) => c,
-            None => return Err("No auto-reinvest config found for this vault or unauthorized".to_string()),
+            None => {
+                return Err(
+                    "No auto-reinvest config found for this vault or unauthorized".to_string(),
+                )
+            }
         };
 
         Ok(PlanStatusResponse {
@@ -949,7 +975,11 @@ fn retry_failed_plan(vault_id: u64) -> Result<AutoReinvestConfig, String> {
             .find(|c| c.vault_id == vault_id && c.owner == caller)
         {
             Some(c) => c,
-            None => return Err("No auto-reinvest config found for this vault or unauthorized".to_string()),
+            None => {
+                return Err(
+                    "No auto-reinvest config found for this vault or unauthorized".to_string(),
+                )
+            }
         };
 
         // Validate plan is in Error state
@@ -1044,7 +1074,10 @@ fn create_listing(vault_id: u64, price_sats: u64) -> Result<MarketListing, Strin
         record_event(
             vault_id,
             "VAULT_LISTED",
-            &format!("Vault listed for {} satoshis with listing ID {}", price_sats, listing.id),
+            &format!(
+                "Vault listed for {} satoshis with listing ID {}",
+                price_sats, listing.id
+            ),
         );
     }
 
@@ -1248,13 +1281,9 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     };
 
     // Call icrc1_balance_of : (record { owner; subaccount }) -> (nat)
-    let (balance_nat,): (Nat,) = ic_cdk::call(
-        ledger_id,
-        "icrc1_balance_of",
-        (account,),
-    )
-    .await
-    .map_err(|e| format!("Failed to call ckBTC ledger: {}", e.1))?;
+    let (balance_nat,): (Nat,) = ic_cdk::call(ledger_id, "icrc1_balance_of", (account,))
+        .await
+        .map_err(|e| format!("Failed to call ckBTC ledger: {}", e.1))?;
 
     // Convert Nat to u64 safely
     let synced_balance: u64 = balance_nat
@@ -1356,9 +1385,88 @@ async fn get_withdraw_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
 // Threshold Signing (Placeholder)
 // =======================
 
+// =======================
+// Digital Will (Mock Key Oracle)
+// =======================
+
+/// Internal Helper: Simulates deriving a secure key (Mocking vetKeys).
+/// This generates a deterministic decryption key based on vault_id.
+fn derive_vault_key(vault_id: u64) -> String {
+    // Master secret for key derivation (internal only, not exposed)
+    let master_secret = "IRONCLAD_MASTER_SECRET_2025_VAULT";
+    let input = format!("{}_{}", master_secret, vault_id);
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize()) // Returns 64-character hex string
+}
+
+/// Endpoint to get the decryption key for Digital Will.
+/// Access Control (Dead Man Switch Logic):
+/// - Owner: Always has access
+/// - Beneficiary: Only has access after inheritance timeout expires
+#[update]
+fn get_digital_will_key(vault_id: u64) -> Result<String, String> {
+    let caller = msg_caller();
+    let now = now_sec();
+
+    // Check access permissions and determine if key should be returned
+    let (should_grant_access, access_type) = with_state(|state| {
+        let vault = state
+            .vaults
+            .iter()
+            .find(|v| v.id == vault_id)
+            .ok_or("Vault not found")?;
+
+        // Check if Digital Will note exists
+        if vault.encrypted_note.is_none() {
+            return Err("Digital Will note not found for this vault.".to_string());
+        }
+
+        // --- Conditional Access Logic (Dead Man Switch) ---
+        let is_owner = vault.owner == caller;
+        let is_beneficiary = vault.beneficiary == Some(caller);
+        let is_time_expired = now > (vault.last_keep_alive + vault.inheritance_timeout);
+
+        if is_owner {
+            Ok((true, "owner"))
+        } else if is_beneficiary && is_time_expired {
+            Ok((true, "beneficiary"))
+        } else {
+            Err("Access Denied: The inheritance conditions are not met.".to_string())
+        }
+    })?;
+
+    // Record event after releasing borrow
+    if should_grant_access {
+        if access_type == "owner" {
+            record_event(
+                vault_id,
+                "DIGITAL_WILL_KEY_ACCESS",
+                "Owner accessed Digital Will key",
+            );
+        } else {
+            record_event(
+                vault_id,
+                "DIGITAL_WILL_KEY_ACCESS",
+                "Beneficiary accessed Digital Will key after inheritance timeout",
+            );
+        }
+        Ok(derive_vault_key(vault_id))
+    } else {
+        Err("Access Denied: The inheritance conditions are not met.".to_string())
+    }
+}
+
+// =======================
+// Bitcoin Signing
+// =======================
+
 /// Request BTC signature using threshold ECDSA (real integration)
 #[update]
-async fn request_btc_signature(vault_id: u64, message: Vec<u8>) -> Result<SignatureResponse, String> {
+async fn request_btc_signature(
+    vault_id: u64,
+    message: Vec<u8>,
+) -> Result<SignatureResponse, String> {
     let caller = msg_caller();
 
     let owns = with_state(|state| {
@@ -1394,15 +1502,11 @@ async fn request_btc_signature(vault_id: u64, message: Vec<u8>) -> Result<Signat
     // ECDSA signing requires ~26.2B cycles per signature
     let mgmt_canister = Principal::from_text("aaaaa-aa").unwrap();
     let cycles: u128 = 30_000_000_000; // 30 billion cycles (buffer for safety)
-    
-    let (resp,): (SignWithEcdsaResponse,) = ic_cdk::api::call::call_with_payment128(
-        mgmt_canister,
-        "sign_with_ecdsa",
-        (arg,),
-        cycles,
-    )
-    .await
-    .map_err(|e| format!("Failed to sign with ECDSA: {}", e.1))?;
+
+    let (resp,): (SignWithEcdsaResponse,) =
+        ic_cdk::api::call::call_with_payment128(mgmt_canister, "sign_with_ecdsa", (arg,), cycles)
+            .await
+            .map_err(|e| format!("Failed to sign with ECDSA: {}", e.1))?;
 
     // Extract signature from response
     let signature = resp.signature;
