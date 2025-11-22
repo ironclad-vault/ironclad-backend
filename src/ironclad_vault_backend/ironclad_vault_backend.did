@@ -21,6 +21,9 @@ type Vault = record {
     lock_until: nat64;
     status: VaultStatus;
     balance: nat64;
+    beneficiary: opt principal;      // NEW: designated heir
+    last_keep_alive: nat64;          // NEW: timestamp of last owner activity
+    inheritance_timeout: nat64;      // NEW: seconds of inactivity before claim
     created_at: nat64;
     updated_at: nat64;
 };
@@ -94,7 +97,7 @@ type SignatureResponse = record {
 };
 
 service : {
-    create_vault: (nat64, nat64) -> (Vault);
+    create_vault: (nat64, nat64, opt principal) -> (Vault);
     get_my_vaults: () -> (vec Vault) query;
     get_vault: (nat64) -> (opt Vault) query;
     get_vault_events: (nat64) -> (vec VaultEvent) query;
@@ -124,4 +127,6 @@ service : {
     get_deposit_proof: (nat64) -> (variant { Ok: BitcoinTxProof; Err: text }) query;
     get_withdraw_proof: (nat64) -> (variant { Ok: BitcoinTxProof; Err: text }) query;
     request_btc_signature: (nat64, blob) -> (variant { Ok: SignatureResponse; Err: text });
+    ping_alive: (nat64) -> (variant { Ok: Vault; Err: text });
+    claim_inheritance: (nat64) -> (variant { Ok: Vault; Err: text });
 }

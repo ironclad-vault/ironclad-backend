@@ -89,6 +89,11 @@ pub struct Vault {
     pub status: VaultStatus,
     pub balance: u64,                   // current balance (dummy / real later)
 
+    // === INHERITANCE PROTOCOL (Dead Man Switch) ===
+    pub beneficiary: Option<Principal>,  // designated heir
+    pub last_keep_alive: u64,            // timestamp of last owner activity
+    pub inheritance_timeout: u64,        // seconds of inactivity before claim (default: 180 days)
+
     // Metadata
     pub created_at: u64,
     pub updated_at: u64,
@@ -245,10 +250,10 @@ fn init() {
 // Public methods
 // =======================
 
-/// Create a new vault with a lock_until time and optional expected_deposit.
+/// Create a new vault with a lock_until time, optional expected_deposit, and optional beneficiary.
 /// For now btc_address is a placeholder string; later we'll plug real BTC.
 #[update]
-fn create_vault(lock_until: u64, expected_deposit: u64) -> Vault {
+fn create_vault(lock_until: u64, expected_deposit: u64, beneficiary: Option<Principal>) -> Vault {
     let caller = msg_caller();
     let ts = now_sec();
 
@@ -274,6 +279,9 @@ fn create_vault(lock_until: u64, expected_deposit: u64) -> Vault {
             lock_until,
             status: VaultStatus::PendingDeposit,
             balance: 0,
+            beneficiary,                                      // Set from argument
+            last_keep_alive: ts,                              // Initialize to now
+            inheritance_timeout: 15_552_000,                  // Default 180 days (6 months) in seconds
             created_at: ts,
             updated_at: ts,
         };
@@ -559,6 +567,82 @@ fn get_withdrawable_vaults() -> Vec<Vault> {
 }
 
 // =======================
+// Inheritance Protocol (Dead Man Switch)
+// =======================
+
+/// Ping alive to reset the dead man switch timer.
+/// Owner must call this periodically to prevent beneficiary from claiming.
+#[update]
+fn ping_alive(vault_id: u64) -> Result<Vault, String> {
+    let caller = msg_caller();
+    let ts = now_sec();
+    
+    let result = with_state_mut(|state| {
+        let vault = state.vaults.iter_mut().find(|v| v.id == vault_id)
+            .ok_or("Vault not found")?;
+            
+        if vault.owner != caller {
+            return Err("Unauthorized".to_string());
+        }
+        
+        vault.last_keep_alive = ts; // Reset timer
+        vault.updated_at = ts;
+        Ok(vault.clone())
+    });
+
+    if let Ok(ref _v) = result {
+        record_event(
+            vault_id,
+            "PING_ALIVE",
+            &format!("Owner pinged alive, reset dead man switch timer"),
+        );
+    }
+
+    result
+}
+
+/// Claim inheritance after owner has been inactive for the timeout period.
+/// Only the designated beneficiary can call this.
+#[update]
+fn claim_inheritance(vault_id: u64) -> Result<Vault, String> {
+    let caller = msg_caller();
+    let ts = now_sec();
+    
+    let result = with_state_mut(|state| {
+        let vault = state.vaults.iter_mut().find(|v| v.id == vault_id)
+            .ok_or("Vault not found")?;
+            
+        if vault.beneficiary != Some(caller) {
+            return Err("Not the beneficiary".to_string());
+        }
+        
+        // Check timeout (Dead Man Switch)
+        if ts < vault.last_keep_alive + vault.inheritance_timeout {
+            return Err("Owner is still considered active".to_string());
+        }
+        
+        // Transfer ownership
+        let old_owner = vault.owner;
+        vault.owner = caller;
+        vault.beneficiary = None; // Reset beneficiary
+        vault.last_keep_alive = ts;
+        vault.updated_at = ts;
+        
+        Ok((vault.clone(), old_owner))
+    });
+
+    if let Ok((ref _v, old_owner)) = result {
+        record_event(
+            vault_id,
+            "INHERITANCE_CLAIMED",
+            &format!("Vault ownership transferred from {} to beneficiary via inheritance", old_owner),
+        );
+    }
+
+    result.map(|(v, _)| v)
+}
+
+// =======================
 // Auto-Reinvest System
 // =======================
 
@@ -767,6 +851,9 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             lock_until: ts + config.new_lock_duration,
             status: VaultStatus::ActiveLocked,
             balance: old_balance,
+            beneficiary: None,                    // No beneficiary for auto-reinvested vaults
+            last_keep_alive: ts,                  // Initialize to now
+            inheritance_timeout: 15_552_000,      // Default 180 days
             created_at: ts,
             updated_at: ts,
         };
@@ -920,6 +1007,11 @@ fn create_listing(vault_id: u64, price_sats: u64) -> Result<MarketListing, Strin
             return Err("Cannot list withdrawn vault".to_string());
         }
 
+        // Bond validation: price must be lower than balance to ensure positive yield
+        if price_sats >= vault.balance {
+            return Err("Price must be lower than balance (Bond Yield required)".to_string());
+        }
+
         // Check for existing active listing
         if state
             .listings
@@ -1058,6 +1150,7 @@ fn buy_listing(listing_id: u64) -> Result<Vault, String> {
 
         // Transfer vault ownership
         vault.owner = caller;
+        vault.beneficiary = None; // Security fix: reset beneficiary so old beneficiary can't steal from new owner
         vault.updated_at = ts;
 
         // Update listing
