@@ -1,21 +1,26 @@
 // src/ironclad_vault_backend/src/lib.rs
 
 use candid::{CandidType, Deserialize, Nat, Principal};
-use hex;
-use ic_cdk::api::{msg_caller, time};
+use ic_cdk::api::{canister_self, msg_caller, time};
 use ic_cdk_macros::{init, query, update};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 // =======================
 // Constants
 // =======================
 
 // ckBTC / ckTESTBTC ledger canister IDs (from official ICP docs)
-// Mainnet ckBTC ledger:      mxzaz-hqaaa-aaaar-qaada-cai
-// Testnet4 ckTESTBTC ledger: mc6ru-gyaaa-aaaar-qaaaq-cai
-const CKBTC_LEDGER_CANISTER_ID: &str = "mc6ru-gyaaa-aaaar-qaaaq-cai";
-// NOTE: swap to mxzaz-hqaaa-aaaar-qaada-cai when pointing to mainnet ckBTC.
+// Mainnet ckBTC ledger (REAL MONEY):     mxzaz-hqaaa-aaaar-qaada-cai
+// Mainnet ckTESTBTC ledger (HACKATHON):  mc6ru-gyaaa-aaaar-qaaaq-cai
+const LEDGER_CANISTER_MAINNET: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+const LEDGER_CANISTER_TESTNET: &str = "mc6ru-gyaaa-aaaar-qaaaq-cai";
+
+// Local dfx mock ledger (will be set during init)
+thread_local! {
+    static LEDGER_CANISTER_ID: RefCell<Option<String>> = RefCell::new(None);
+}
 
 // ECDSA key IDs for threshold signing
 // Local dfx replica: "dfx_test_key"
@@ -32,6 +37,34 @@ const ECDSA_KEY_NAME: &str = "test_key_1";
 struct Icrc1Account {
     owner: Principal,
     subaccount: Option<Vec<u8>>,
+}
+
+// --- Transfer structs untuk Withdraw ckBTC ---
+#[derive(CandidType, Deserialize, Clone)]
+struct TransferArg {
+    from_subaccount: Option<Vec<u8>>,
+    to: Icrc1Account,
+    amount: Nat,
+    fee: Option<Nat>,
+    memo: Option<Vec<u8>>,
+    created_at_time: Option<u64>,
+}
+
+#[derive(CandidType, Deserialize)]
+enum TransferResult {
+    Ok(Nat),
+    Err(TransferError),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+enum TransferError {
+    BadFee { expected_fee: Nat },
+    InsufficientFunds { balance: Nat },
+    TooOld,
+    CreatedInFuture { ledger_time: u64 },
+    Duplicate { duplicate_of: Nat },
+    TemporarilyUnavailable,
+    GenericError { error_code: Nat, message: String },
 }
 
 // ECDSA types (matching management canister interface)
@@ -59,13 +92,14 @@ struct SignWithEcdsaResponse {
     signature: Vec<u8>,
 }
 
-#[derive(Clone, CandidType, Deserialize)]
+#[derive(Clone, CandidType, Deserialize, PartialEq, Debug)]
 pub enum NetworkMode {
     Mock,
     CkBTCMainnet,
+    CkBTCTestnet,
 }
 
-#[derive(Clone, CandidType, Deserialize)]
+#[derive(Clone, Debug, CandidType, Deserialize)]
 pub enum VaultStatus {
     PendingDeposit,
     ActiveLocked,
@@ -97,6 +131,7 @@ pub struct Vault {
 
     // === DIGITAL WILL (Encrypted Message) ===
     pub encrypted_note: Option<String>, // Hex-encoded ciphertext for Digital Will
+    pub secure_key: Option<String>,     // Decryption key (PRIVATE - DO NOT EXPOSE)
 
     // Metadata
     pub created_at: u64,
@@ -183,7 +218,8 @@ pub struct SignatureResponse {
 #[derive(Default)]
 pub struct State {
     pub next_id: u64,
-    pub vaults: Vec<Vault>,
+    pub user_vaults: BTreeMap<Principal, Vec<Vault>>, // Stores vaults by Owner
+    pub vault_index: BTreeMap<u64, Principal>,        // Maps VaultID -> Owner (for quick lookup)
     pub history: Vec<VaultEvent>,
     pub auto_reinvest: Vec<AutoReinvestConfig>,
     pub listings: Vec<MarketListing>,
@@ -242,19 +278,109 @@ fn record_event(vault_id: u64, action: &str, notes: &str) {
 }
 
 // =======================
+// Helper Methods (Internal Logic)
+// =======================
+
+/// Internal helper: Get mutable reference to a vault by ID
+/// Returns None if vault doesn't exist or caller doesn't own it
+fn _get_vault_mut<'a>(
+    state: &'a mut State,
+    vault_id: u64,
+    caller: Principal,
+) -> Option<&'a mut Vault> {
+    // Find owner from vault_index
+    let owner = state.vault_index.get(&vault_id)?;
+
+    // Verify caller owns the vault
+    if *owner != caller {
+        return None;
+    }
+
+    // Get mutable reference to user's vault list
+    let vaults = state.user_vaults.get_mut(owner)?;
+
+    // Find the specific vault in the vector by ID
+    vaults.iter_mut().find(|v| v.id == vault_id)
+}
+
+/// Internal helper: Get immutable reference to a vault by ID
+/// Returns None if vault doesn't exist or caller doesn't own it
+fn _get_vault<'a>(state: &'a State, vault_id: u64, caller: Principal) -> Option<&'a Vault> {
+    // Find owner from vault_index
+    let owner = state.vault_index.get(&vault_id)?;
+
+    // Verify caller owns the vault
+    if *owner != caller {
+        return None;
+    }
+
+    // Get reference to user's vault list
+    let vaults = state.user_vaults.get(owner)?;
+
+    // Find the specific vault in the vector by ID
+    vaults.iter().find(|v| v.id == vault_id)
+}
+
+/// Internal helper: Transfer vault ownership to a new owner
+/// This safely moves the vault from old owner's list to new owner's list
+fn _transfer_vault(state: &mut State, vault_id: u64, new_owner: Principal) -> Result<(), String> {
+    // Find old owner from vault_index
+    let old_owner = state
+        .vault_index
+        .get(&vault_id)
+        .cloned()
+        .ok_or("Vault not found")?;
+
+    // Remove vault from old owner's list
+    let mut vault = {
+        let old_vaults = state
+            .user_vaults
+            .get_mut(&old_owner)
+            .ok_or("Old owner's vault list not found")?;
+
+        let vault_pos = old_vaults
+            .iter()
+            .position(|v| v.id == vault_id)
+            .ok_or("Vault not found in old owner's list")?;
+
+        old_vaults.remove(vault_pos)
+    };
+
+    // Update vault data
+    let ts = now_sec();
+    vault.owner = new_owner;
+    vault.beneficiary = None; // Security: reset beneficiary on ownership transfer
+    vault.last_keep_alive = ts; // Reset keep-alive timer for new owner
+    vault.updated_at = ts;
+
+    // Add vault to new owner's list
+    state.user_vaults.entry(new_owner).or_default().push(vault);
+
+    // Update vault_index to point vault_id -> new_owner
+    state.vault_index.insert(vault_id, new_owner);
+
+    Ok(())
+}
+
+// =======================
 // Lifecycle
 // =======================
 
 #[init]
 fn init() {
-    // nothing special for now
+    // For local dfx testing, default to mock_ledger if it exists.
+    // For production/testnet, this will be overridden by the explicit canister ID.
+    // The mock ledger will be deployed as the first canister in dfx.json
+    LEDGER_CANISTER_ID.with(|id| {
+        *id.borrow_mut() = Some(LEDGER_CANISTER_MAINNET.to_string());
+    });
 }
 
 // =======================
 // Public methods
 // =======================
 
-/// Create a new vault with a lock_until time, optional expected_deposit, optional beneficiary, and optional encrypted Digital Will note.
+/// Create a new vault with a lock_until time, optional expected_deposit, optional beneficiary, optional encrypted Digital Will note, and optional decryption key.
 /// For now btc_address is a placeholder string; later we'll plug real BTC.
 #[update]
 fn create_vault(
@@ -262,8 +388,15 @@ fn create_vault(
     expected_deposit: u64,
     beneficiary: Option<Principal>,
     encrypted_note: Option<String>,
+    secure_key: Option<String>,
 ) -> Vault {
     let caller = msg_caller();
+    
+    // SECURITY: Block anonymous users
+    if caller == Principal::anonymous() {
+        ic_cdk::trap("Anonymous calls not allowed. Connect your wallet.");
+    }
+    
     let ts = now_sec();
 
     let vault = with_state_mut(|state| {
@@ -292,11 +425,21 @@ fn create_vault(
             last_keep_alive: ts,             // Initialize to now
             inheritance_timeout: 15_552_000, // Default 180 days (6 months) in seconds
             encrypted_note,                  // Digital Will encrypted message
+            secure_key,                      // Decryption key (stored privately)
             created_at: ts,
             updated_at: ts,
         };
 
-        state.vaults.push(vault.clone());
+        // Add vault to user's vault list
+        state
+            .user_vaults
+            .entry(caller)
+            .or_default()
+            .push(vault.clone());
+
+        // Add vault ID to index
+        state.vault_index.insert(id, caller);
+
         vault
     });
 
@@ -309,29 +452,45 @@ fn create_vault(
 }
 
 /// Get all vaults owned by the caller.
+/// SECURITY: secure_key is sanitized (set to None) before returning.
 #[query]
 fn get_my_vaults() -> Vec<Vault> {
     let caller = msg_caller();
+    
+    // SECURITY: Block anonymous users
+    if caller == Principal::anonymous() {
+        return Vec::new();
+    }
+    
     with_state(|state| {
         state
-            .vaults
-            .iter()
-            .filter(|v| v.owner == caller)
-            .cloned()
-            .collect()
+            .user_vaults
+            .get(&caller)
+            .map(|vaults| {
+                vaults
+                    .iter()
+                    .map(|v| {
+                        let mut sanitized = v.clone();
+                        sanitized.secure_key = None; // CRITICAL: Never expose secure_key
+                        sanitized
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     })
 }
 
 /// Get a single vault by id, only if owned by caller.
+/// SECURITY: secure_key is sanitized (set to None) before returning.
 #[query]
 fn get_vault(id: u64) -> Option<Vault> {
     let caller = msg_caller();
     with_state(|state| {
-        state
-            .vaults
-            .iter()
-            .find(|v| v.id == id && v.owner == caller)
-            .cloned()
+        _get_vault(state, id, caller).map(|v| {
+            let mut sanitized = v.clone();
+            sanitized.secure_key = None; // CRITICAL: Never expose secure_key
+            sanitized
+        })
     })
 }
 
@@ -341,7 +500,11 @@ fn get_vault_events(id: u64) -> Vec<VaultEvent> {
     let caller = msg_caller();
     with_state(|state| {
         // Ensure caller owns the vault before showing history
-        let owns = state.vaults.iter().any(|v| v.id == id && v.owner == caller);
+        let owns = state
+            .vault_index
+            .get(&id)
+            .map(|owner| *owner == caller)
+            .unwrap_or(false);
 
         if !owns {
             return Vec::new();
@@ -362,15 +525,16 @@ fn get_vault_events(id: u64) -> Vec<VaultEvent> {
 /// with real BTC / ckBTC integration.
 #[update]
 fn mock_deposit_vault(id: u64, amount: u64) -> Result<Vault, String> {
+    // Check if we are in Mock mode
+    if !matches!(get_mode(), NetworkMode::Mock) {
+        return Err("Mock deposit only allowed in Mock Mode".to_string());
+    }
+
     let caller = msg_caller();
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = match state.vaults.iter_mut().find(|v| v.id == id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
+        let vault = _get_vault_mut(state, id, caller).ok_or("Vault not found or unauthorized")?;
 
         if amount == 0 {
             return Err("Deposit amount must be greater than 0".to_string());
@@ -402,11 +566,7 @@ fn is_vault_unlockable(id: u64) -> Result<bool, String> {
     let now = now_sec();
 
     with_state(|state| {
-        let vault = match state.vaults.iter().find(|v| v.id == id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Vault not found or unauthorized".to_string()),
-            None => return Err("Vault not found or unauthorized".to_string()),
-        };
+        let vault = _get_vault(state, id, caller).ok_or("Vault not found or unauthorized")?;
 
         match vault.status {
             VaultStatus::ActiveLocked if now >= vault.lock_until => Ok(true),
@@ -422,11 +582,7 @@ fn unlock_vault(id: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = match state.vaults.iter_mut().find(|v| v.id == id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
+        let vault = _get_vault_mut(state, id, caller).ok_or("Vault not found or unauthorized")?;
 
         match vault.status {
             VaultStatus::ActiveLocked => {
@@ -459,6 +615,7 @@ fn unlock_vault(id: u64) -> Result<Vault, String> {
 }
 
 /// Get all unlockable vaults for the caller (timelock expired).
+/// SECURITY: secure_key is sanitized (set to None) before returning.
 #[query]
 fn get_unlockable_vaults() -> Vec<Vault> {
     let caller = msg_caller();
@@ -466,15 +623,22 @@ fn get_unlockable_vaults() -> Vec<Vault> {
 
     with_state(|state| {
         state
-            .vaults
-            .iter()
-            .filter(|v| {
-                v.owner == caller
-                    && matches!(v.status, VaultStatus::ActiveLocked)
-                    && now >= v.lock_until
+            .user_vaults
+            .get(&caller)
+            .map(|vaults| {
+                vaults
+                    .iter()
+                    .filter(|v| {
+                        matches!(v.status, VaultStatus::ActiveLocked) && now >= v.lock_until
+                    })
+                    .map(|v| {
+                        let mut sanitized = v.clone();
+                        sanitized.secure_key = None; // CRITICAL: Never expose secure_key
+                        sanitized
+                    })
+                    .collect()
             })
-            .cloned()
-            .collect()
+            .unwrap_or_default()
     })
 }
 
@@ -483,10 +647,7 @@ fn get_unlockable_vaults() -> Vec<Vault> {
 fn preview_withdraw(id: u64) -> Result<u64, String> {
     let caller = msg_caller();
     with_state(|state| {
-        let vault = match state.vaults.iter().find(|v| v.id == id) {
-            Some(v) if v.owner == caller => v,
-            _ => return Err("Vault not found or unauthorized".to_string()),
-        };
+        let vault = _get_vault(state, id, caller).ok_or("Vault not found or unauthorized")?;
 
         if !matches!(vault.status, VaultStatus::Unlockable) {
             return Err("Vault is not unlockable".to_string());
@@ -500,64 +661,144 @@ fn preview_withdraw(id: u64) -> Result<u64, String> {
     })
 }
 
-/// Withdraw from a vault (mock flow), updates state and logs events.
+/// Withdraw from a vault - Real ICRC-1 Transfer
 #[update]
-fn withdraw_vault(id: u64, amount: u64) -> Result<Vault, String> {
-    let caller = msg_caller();
-    let ts = now_sec();
-
-    let result = with_state_mut(|state| {
-        let vault = match state.vaults.iter_mut().find(|v| v.id == id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
-
-        if !matches!(vault.status, VaultStatus::Unlockable) {
-            return Err("Vault is not unlockable".to_string());
+async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
+    // 1. Ambil data vault dan validasi
+    let (owner, amount_e8s, ckbtc_subaccount) = with_state(|s| {
+        let vault = _get_vault(s, vault_id, msg_caller()).ok_or("Vault not found")?;
+        
+        // Validasi Keamanan
+        if vault.owner != msg_caller() {
+            return Err("Unauthorized".to_string());
+        }
+        
+        // Cek status vault
+        if matches!(vault.status, VaultStatus::Withdrawn) {
+            return Err("Vault already withdrawn".to_string());
         }
 
-        if amount == 0 {
-            return Err("Withdraw amount must be greater than 0".to_string());
-        }
+        Ok((vault.owner, vault.balance, vault.ckbtc_subaccount.clone()))
+    })?;
 
-        if amount > vault.balance {
-            return Err("Withdraw amount exceeds balance".to_string());
-        }
+    // 2. Hitung Amount yang ditransfer (Balance - Fee Transaksi)
+    let fee = 10u64; // Fee ckBTC standar = 10 e8s
+    if amount_e8s <= fee {
+        return Err("Balance too low to cover transfer fee".to_string());
+    }
+    let transfer_amount = amount_e8s - fee;
 
-        // Apply withdrawal
-        vault.balance -= amount;
-        if vault.balance == 0 {
-            vault.status = VaultStatus::Withdrawn;
+    // 3. Tentukan ledger tujuan berdasarkan network mode
+    let current_mode = get_mode();
+    
+    let ledger_id = match current_mode {
+        NetworkMode::Mock => {
+            // Mock mode: update status tanpa panggil ledger
+            return with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.status = VaultStatus::Withdrawn;
+                    vault.btc_withdraw_txid = Some(format!("MOCK-TXID-{}", vault_id));
+                    vault.balance = 0;
+                    vault.updated_at = now_sec();
+                    Ok(vault.clone())
+                } else {
+                    Err("Vault not found".to_string())
+                }
+            });
         }
-        let txid = format!("MOCK-TXID-{}", id);
-        vault.btc_withdraw_txid = Some(txid.clone());
-        vault.updated_at = ts;
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+    };
 
-        Ok((vault.clone(), txid))
+    // 4. Optimistic update: kurangi balance duluan untuk prevent re-entrancy
+    with_state_mut(|state| {
+        if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+            vault.balance = vault.balance.saturating_sub(transfer_amount + fee);
+        }
     });
 
-    if let Ok((ref _v, ref txid)) = result {
-        record_event(id, "WITHDRAW_REQUESTED", &format!("Requested withdraw"));
-        record_event(id, "WITHDRAW_COMPLETED", &format!("Withdraw txid {}", txid));
-    }
+    // 5. Siapkan transfer ke ledger
+    let ledger_principal = Principal::from_text(&ledger_id)
+        .map_err(|_| "Invalid ledger canister ID".to_string())?;
+    
+    let transfer_args = TransferArg {
+        from_subaccount: ckbtc_subaccount,
+        to: Icrc1Account {
+            owner: owner,
+            subaccount: None,
+        },
+        amount: Nat::from(transfer_amount),
+        fee: None,
+        memo: None,
+        created_at_time: None,
+    };
 
-    result.map(|(v, _)| v)
+    // 6. Eksekusi transfer
+    #[allow(deprecated)]
+    let (result,): (TransferResult,) = ic_cdk::call(
+        ledger_principal,
+        "icrc1_transfer",
+        (transfer_args,),
+    )
+    .await
+    .map_err(|e| format!("Failed to call ledger: {:?}", e))?;
+
+    // 7. Handle hasil - Commit atau Rollback
+    match result {
+        TransferResult::Ok(block_index) => {
+            // Sukses! Update status jadi Withdrawn
+            let result = with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.status = VaultStatus::Withdrawn;
+                    vault.btc_withdraw_txid = Some(format!("block_index:{}", block_index));
+                    vault.updated_at = now_sec();
+                    Ok(vault.clone())
+                } else {
+                    Err("Vault not found during finalization".to_string())
+                }
+            });
+
+            if let Ok(ref _v) = result {
+                record_event(vault_id, "WITHDRAW_COMPLETED", &format!("block_index: {}", block_index));
+            }
+
+            result
+        },
+        TransferResult::Err(e) => {
+            // Gagal! Rollback balance
+            with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.balance = vault.balance.saturating_add(transfer_amount + fee);
+                }
+            });
+            
+            record_event(vault_id, "WITHDRAW_FAILED", &format!("{:?}", e));
+            Err(format!("Ledger transfer failed: {:?}", e))
+        }
+    }
 }
 
 /// Get all withdrawable vaults for the caller (Unlockable and balance > 0).
+/// SECURITY: secure_key is sanitized (set to None) before returning.
 #[query]
 fn get_withdrawable_vaults() -> Vec<Vault> {
     let caller = msg_caller();
     with_state(|state| {
         state
-            .vaults
-            .iter()
-            .filter(|v| {
-                v.owner == caller && matches!(v.status, VaultStatus::Unlockable) && v.balance > 0
+            .user_vaults
+            .get(&caller)
+            .map(|vaults| {
+                vaults
+                    .iter()
+                    .filter(|v| matches!(v.status, VaultStatus::Unlockable) && v.balance > 0)
+                    .map(|v| {
+                        let mut sanitized = v.clone();
+                        sanitized.secure_key = None; // CRITICAL: Never expose secure_key
+                        sanitized
+                    })
+                    .collect()
             })
-            .cloned()
-            .collect()
+            .unwrap_or_default()
     })
 }
 
@@ -573,15 +814,8 @@ fn ping_alive(vault_id: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = state
-            .vaults
-            .iter_mut()
-            .find(|v| v.id == vault_id)
-            .ok_or("Vault not found")?;
-
-        if vault.owner != caller {
-            return Err("Unauthorized".to_string());
-        }
+        let vault =
+            _get_vault_mut(state, vault_id, caller).ok_or("Vault not found or unauthorized")?;
 
         vault.last_keep_alive = ts; // Reset timer
         vault.updated_at = ts;
@@ -607,27 +841,40 @@ fn claim_inheritance(vault_id: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        let vault = state
-            .vaults
-            .iter_mut()
-            .find(|v| v.id == vault_id)
+        // Step 1: Look up the vault owner from the index
+        let old_owner = state
+            .vault_index
+            .get(&vault_id)
+            .cloned()
             .ok_or("Vault not found")?;
 
+        // Step 2: Get the vault from the owner's list
+        let vaults = state
+            .user_vaults
+            .get(&old_owner)
+            .ok_or("Vault owner not found")?;
+
+        let vault = vaults
+            .iter()
+            .find(|v| v.id == vault_id)
+            .ok_or("Vault not found in owner's list")?;
+
+        // Step 3: Validate beneficiary - MUST be the caller
         if vault.beneficiary != Some(caller) {
             return Err("Not the beneficiary".to_string());
         }
 
-        // Check timeout (Dead Man Switch)
+        // Step 4: Validate timeout (Dead Man Switch)
         if ts < vault.last_keep_alive + vault.inheritance_timeout {
             return Err("Owner is still considered active".to_string());
         }
 
-        // Transfer ownership
-        let old_owner = vault.owner;
-        vault.owner = caller;
-        vault.beneficiary = None; // Reset beneficiary
-        vault.last_keep_alive = ts;
-        vault.updated_at = ts;
+        // Step 5: All validations passed - transfer ownership
+        _transfer_vault(state, vault_id, caller)?;
+
+        // Step 6: Get the vault after transfer to return it
+        // Now we can safely use _get_vault since caller is the new owner
+        let vault = _get_vault(state, vault_id, caller).ok_or("Vault not found after transfer")?;
 
         Ok((vault.clone(), old_owner))
     });
@@ -660,12 +907,8 @@ fn schedule_auto_reinvest(
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        // Find and validate vault
-        let vault = match state.vaults.iter().find(|v| v.id == vault_id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
+        // Find and validate vault using helper
+        let vault = _get_vault(state, vault_id, caller).ok_or("Vault not found or unauthorized")?;
 
         // Reject if vault is already withdrawn
         if matches!(vault.status, VaultStatus::Withdrawn) {
@@ -825,12 +1068,9 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             }
         };
 
-        // Find source vault
-        let source_vault = match state.vaults.iter_mut().find(|v| v.id == vault_id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
+        // Find source vault using helper
+        let source_vault =
+            _get_vault_mut(state, vault_id, caller).ok_or("Vault not found or unauthorized")?;
 
         // Validate source vault status
         if !matches!(source_vault.status, VaultStatus::Unlockable) {
@@ -873,11 +1113,20 @@ fn execute_auto_reinvest(vault_id: u64) -> Result<Vault, String> {
             last_keep_alive: ts, // Initialize to now
             inheritance_timeout: 15_552_000, // Default 180 days
             encrypted_note: None, // No Digital Will for auto-created vaults
+            secure_key: None,    // No decryption key for auto-created vaults
             created_at: ts,
             updated_at: ts,
         };
 
-        state.vaults.push(new_vault.clone());
+        // Add new vault to user's vault list
+        state
+            .user_vaults
+            .entry(caller)
+            .or_default()
+            .push(new_vault.clone());
+
+        // Add new vault ID to index
+        state.vault_index.insert(new_id, caller);
 
         // Update the auto-reinvest config - keep it Active and increment counter
         if let Some(cfg) = state
@@ -1022,12 +1271,8 @@ fn create_listing(vault_id: u64, price_sats: u64) -> Result<MarketListing, Strin
     }
 
     let result = with_state_mut(|state| {
-        // Find and validate vault
-        let vault = match state.vaults.iter().find(|v| v.id == vault_id) {
-            Some(v) if v.owner == caller => v,
-            Some(_) => return Err("Unauthorized: You don't own this vault".to_string()),
-            None => return Err("Vault not found".to_string()),
-        };
+        // Find and validate vault using helper
+        let vault = _get_vault(state, vault_id, caller).ok_or("Vault not found or unauthorized")?;
 
         // Validate vault status
         if matches!(vault.status, VaultStatus::PendingDeposit) {
@@ -1152,44 +1397,55 @@ fn buy_listing(listing_id: u64) -> Result<Vault, String> {
     let ts = now_sec();
 
     let result = with_state_mut(|state| {
-        // Find and validate listing
-        let listing = match state.listings.iter_mut().find(|l| l.id == listing_id) {
-            Some(l) => l,
-            None => return Err("Listing not found".to_string()),
+        // Find and validate listing (get vault_id then release borrow)
+        let vault_id = {
+            let listing = match state.listings.iter().find(|l| l.id == listing_id) {
+                Some(l) => l,
+                None => return Err("Listing not found".to_string()),
+            };
+
+            if !matches!(listing.status, ListingStatus::Active) {
+                return Err("Listing is not active".to_string());
+            }
+
+            if listing.seller == caller {
+                return Err("Cannot buy your own listing".to_string());
+            }
+
+            listing.vault_id
         };
 
-        if !matches!(listing.status, ListingStatus::Active) {
-            return Err("Listing is not active".to_string());
+        // Validate vault exists and check status (read-only check)
+        {
+            let owner = state.vault_index.get(&vault_id).ok_or("Vault not found")?;
+
+            let vaults = state
+                .user_vaults
+                .get(owner)
+                .ok_or("Vault owner not found")?;
+
+            let vault = vaults
+                .iter()
+                .find(|v| v.id == vault_id)
+                .ok_or("Vault not found in owner's list")?;
+
+            if matches!(vault.status, VaultStatus::PendingDeposit) {
+                return Err("Cannot buy vault in PendingDeposit status".to_string());
+            }
+            if matches!(vault.status, VaultStatus::Withdrawn) {
+                return Err("Cannot buy withdrawn vault".to_string());
+            }
         }
 
-        if listing.seller == caller {
-            return Err("Cannot buy your own listing".to_string());
+        // Transfer vault ownership using helper
+        _transfer_vault(state, vault_id, caller)?;
+
+        // Update listing (now we can get mutable borrow)
+        if let Some(listing) = state.listings.iter_mut().find(|l| l.id == listing_id) {
+            listing.status = ListingStatus::Filled;
+            listing.buyer = Some(caller);
+            listing.updated_at = ts;
         }
-
-        let vault_id = listing.vault_id;
-
-        // Find and validate vault
-        let vault = match state.vaults.iter_mut().find(|v| v.id == vault_id) {
-            Some(v) => v,
-            None => return Err("Vault not found".to_string()),
-        };
-
-        if matches!(vault.status, VaultStatus::PendingDeposit) {
-            return Err("Cannot buy vault in PendingDeposit status".to_string());
-        }
-        if matches!(vault.status, VaultStatus::Withdrawn) {
-            return Err("Cannot buy withdrawn vault".to_string());
-        }
-
-        // Transfer vault ownership
-        vault.owner = caller;
-        vault.beneficiary = None; // Security fix: reset beneficiary so old beneficiary can't steal from new owner
-        vault.updated_at = ts;
-
-        // Update listing
-        listing.status = ListingStatus::Filled;
-        listing.buyer = Some(caller);
-        listing.updated_at = ts;
 
         // Disable any active auto-reinvest config for this vault
         if let Some(config) = state
@@ -1200,6 +1456,9 @@ fn buy_listing(listing_id: u64) -> Result<Vault, String> {
             config.enabled = false;
             config.updated_at = ts;
         }
+
+        // Get the vault after transfer to return it
+        let vault = _get_vault(state, vault_id, caller).ok_or("Vault not found after transfer")?;
 
         Ok(vault.clone())
     });
@@ -1231,10 +1490,39 @@ fn set_mode_ckbtc_mainnet() {
     MODE.with(|m| *m.borrow_mut() = NetworkMode::CkBTCMainnet);
 }
 
+/// Set runtime mode to ckBTC Testnet (for hackathon - ckTESTBTC mode money)
+#[update]
+fn set_mode_ckbtc_testnet() {
+    MODE.with(|m| *m.borrow_mut() = NetworkMode::CkBTCTestnet);
+}
+
 /// Get current runtime mode
 #[query]
 fn get_mode_query() -> NetworkMode {
     get_mode()
+}
+
+/// Set the ledger canister ID (for local testing with mock ledger)
+#[update]
+fn set_ledger_canister_id(canister_id: String) {
+    LEDGER_CANISTER_ID.with(|id| {
+        *id.borrow_mut() = Some(canister_id);
+    });
+}
+
+/// Get current ledger canister ID
+#[query]
+fn get_ledger_canister_id() -> String {
+    let mode = get_mode();
+    match mode {
+        NetworkMode::Mock => LEDGER_CANISTER_ID.with(|id| {
+            id.borrow()
+                .clone()
+                .unwrap_or_else(|| LEDGER_CANISTER_MAINNET.to_string())
+        }),
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+    }
 }
 
 // =======================
@@ -1247,19 +1535,13 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     let caller = msg_caller();
     let mode = get_mode();
 
-    // Only allow in CkBTCMainnet mode
-    if !matches!(mode, NetworkMode::CkBTCMainnet) {
-        return Err("ckBTC sync is only available in CkBTCMainnet mode".to_string());
+    // Allow if mode is CkBTCTestnet OR CkBTCMainnet
+    if !matches!(mode, NetworkMode::CkBTCMainnet | NetworkMode::CkBTCTestnet) {
+        return Err("ckBTC sync is only available in CkBTCTestnet or CkBTCMainnet mode".to_string());
     }
 
-    // Find vault and ensure ownership
-    let maybe_vault = with_state(|state| {
-        state
-            .vaults
-            .iter()
-            .find(|v| v.id == vault_id && v.owner == caller)
-            .cloned()
-    });
+    // Find vault and ensure ownership using helper
+    let maybe_vault = with_state(|state| _get_vault(state, vault_id, caller).cloned());
 
     let vault = match maybe_vault {
         Some(v) => v,
@@ -1272,18 +1554,44 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     }
 
     // Call ckBTC ledger to get balance
-    let ledger_id = Principal::from_text(CKBTC_LEDGER_CANISTER_ID)
+    let mode = get_mode();
+    let ledger_canister_id = match mode {
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::Mock => return Err("Cannot sync in Mock mode".to_string()),
+    };
+    let ledger_id = Principal::from_text(&ledger_canister_id)
         .map_err(|e| format!("Invalid ckBTC ledger canister id: {}", e))?;
 
+    // CRITICAL FIX: Check the CANISTER's balance (self-custody), not the user's wallet.
+    // The user must transfer funds TO this canister for them to be locked.
     let account = Icrc1Account {
-        owner: vault.owner,
+        owner: canister_self(), // Canister's own Principal (self-custody)
         subaccount: vault.ckbtc_subaccount.clone(),
     };
 
     // Call icrc1_balance_of : (record { owner; subaccount }) -> (nat)
-    let (balance_nat,): (Nat,) = ic_cdk::call(ledger_id, "icrc1_balance_of", (account,))
-        .await
-        .map_err(|e| format!("Failed to call ckBTC ledger: {}", e.1))?;
+    #[allow(deprecated)]
+    let balance_result = ic_cdk::call(ledger_id, "icrc1_balance_of", (account,)).await;
+
+    // Handle the call result with helpful error messages for local development
+    let (balance_nat,): (Nat,) = match balance_result {
+        Ok(result) => result,
+        Err((_code, msg)) => {
+            // Check if this is the "canister not found" error from local dfx
+            if msg.contains("not found") || msg.contains("Canister not found") {
+                return Err(
+                    format!(
+                        "ckBTC ledger canister '{}' not found. \
+                        For local development, switch to Mock mode in settings or deploy a mock ledger. \
+                        Error: {}", 
+                        ledger_canister_id, msg
+                    )
+                );
+            }
+            return Err(format!("Failed to call ckBTC ledger: {}", msg));
+        }
+    };
 
     // Convert Nat to u64 safely
     let synced_balance: u64 = balance_nat
@@ -1291,21 +1599,55 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
         .try_into()
         .map_err(|_| "ckBTC balance is too large to fit in u64".to_string())?;
 
-    // Update vault balance in state
+    // Update vault balance in state using helper
     let updated_vault = with_state_mut(|state| {
-        if let Some(v) = state
-            .vaults
-            .iter_mut()
-            .find(|v| v.id == vault_id && v.owner == caller)
-        {
+        if let Some(v) = _get_vault_mut(state, vault_id, caller) {
+            let old_status = format!("{:?}", v.status);
+            let old_balance = v.balance;
+            
             v.balance = synced_balance;
             v.updated_at = now_sec();
+            
+            // CRITICAL FIX: Update status to ActiveLocked if deposit was successful
+            // Only transition from PendingDeposit to ActiveLocked if balance is now > 0
+            if matches!(v.status, VaultStatus::PendingDeposit) && synced_balance > 0 {
+                ic_cdk::api::debug_print(format!(
+                    "[SYNC] Status update: {:?} -> ActiveLocked (balance: {} -> {})",
+                    old_status, old_balance, synced_balance
+                ));
+                v.status = VaultStatus::ActiveLocked;
+            } else {
+                ic_cdk::api::debug_print(format!(
+                    "[SYNC] No status update: status={:?}, synced_balance={}, condition_met={}",
+                    old_status,
+                    synced_balance,
+                    matches!(v.status, VaultStatus::PendingDeposit) && synced_balance > 0
+                ));
+            }
+            
             Some(v.clone())
         } else {
+            ic_cdk::api::debug_print(format!("[SYNC] Vault not found: vault_id={}", vault_id));
             None
         }
     })
     .ok_or_else(|| "Vault not found or unauthorized".to_string())?;
+
+    // Record events for audit trail
+    record_event(
+        vault_id,
+        "CKBTC_DEPOSIT_CONFIRMED",
+        &format!("ckBTC deposit confirmed - synced {} satoshis from ledger", synced_balance),
+    );
+    
+    // Record status transition if it occurred
+    if synced_balance > 0 && matches!(updated_vault.status, VaultStatus::ActiveLocked) {
+        record_event(
+            vault_id,
+            "LOCK_STARTED",
+            "Vault moved to ActiveLocked after ckBTC deposit confirmation",
+        );
+    }
 
     Ok(CkbtcSyncResult {
         vault: updated_vault,
@@ -1323,13 +1665,7 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
 async fn get_deposit_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
     let caller = msg_caller();
 
-    let vault = with_state(|state| {
-        state
-            .vaults
-            .iter()
-            .find(|v| v.id == vault_id && v.owner == caller)
-            .cloned()
-    });
+    let vault = with_state(|state| _get_vault(state, vault_id, caller).cloned());
 
     let vault = match vault {
         Some(v) => v,
@@ -1355,13 +1691,7 @@ async fn get_deposit_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
 async fn get_withdraw_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
     let caller = msg_caller();
 
-    let vault = with_state(|state| {
-        state
-            .vaults
-            .iter()
-            .find(|v| v.id == vault_id && v.owner == caller)
-            .cloned()
-    });
+    let vault = with_state(|state| _get_vault(state, vault_id, caller).cloned());
 
     let vault = match vault {
         Some(v) => v,
@@ -1386,19 +1716,8 @@ async fn get_withdraw_proof(vault_id: u64) -> Result<BitcoinTxProof, String> {
 // =======================
 
 // =======================
-// Digital Will (Mock Key Oracle)
+// Digital Will Access Control
 // =======================
-
-/// Internal Helper: Simulates deriving a secure key (Mocking vetKeys).
-/// This generates a deterministic decryption key based on vault_id.
-fn derive_vault_key(vault_id: u64) -> String {
-    // Master secret for key derivation (internal only, not exposed)
-    let master_secret = "IRONCLAD_MASTER_SECRET_2025_VAULT";
-    let input = format!("{}_{}", master_secret, vault_id);
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize()) // Returns 64-character hex string
-}
 
 /// Endpoint to get the decryption key for Digital Will.
 /// Access Control (Dead Man Switch Logic):
@@ -1409,10 +1728,18 @@ fn get_digital_will_key(vault_id: u64) -> Result<String, String> {
     let caller = msg_caller();
     let now = now_sec();
 
-    // Check access permissions and determine if key should be returned
-    let (should_grant_access, access_type) = with_state(|state| {
-        let vault = state
-            .vaults
+    // Check access permissions and retrieve the secure_key
+    let (secure_key, access_type) = with_state(|state| {
+        // Find vault owner from index
+        let owner = state.vault_index.get(&vault_id).ok_or("Vault not found")?;
+
+        // Get vault from owner's list
+        let vaults = state
+            .user_vaults
+            .get(owner)
+            .ok_or("Vault owner not found")?;
+
+        let vault = vaults
             .iter()
             .find(|v| v.id == vault_id)
             .ok_or("Vault not found")?;
@@ -1422,39 +1749,42 @@ fn get_digital_will_key(vault_id: u64) -> Result<String, String> {
             return Err("Digital Will note not found for this vault.".to_string());
         }
 
+        // Check if secure_key exists
+        let key = vault
+            .secure_key
+            .clone()
+            .ok_or("Decryption key not found for this vault.".to_string())?;
+
         // --- Conditional Access Logic (Dead Man Switch) ---
         let is_owner = vault.owner == caller;
         let is_beneficiary = vault.beneficiary == Some(caller);
         let is_time_expired = now > (vault.last_keep_alive + vault.inheritance_timeout);
 
         if is_owner {
-            Ok((true, "owner"))
+            Ok((key, "owner"))
         } else if is_beneficiary && is_time_expired {
-            Ok((true, "beneficiary"))
+            Ok((key, "beneficiary"))
         } else {
             Err("Access Denied: The inheritance conditions are not met.".to_string())
         }
     })?;
 
     // Record event after releasing borrow
-    if should_grant_access {
-        if access_type == "owner" {
-            record_event(
-                vault_id,
-                "DIGITAL_WILL_KEY_ACCESS",
-                "Owner accessed Digital Will key",
-            );
-        } else {
-            record_event(
-                vault_id,
-                "DIGITAL_WILL_KEY_ACCESS",
-                "Beneficiary accessed Digital Will key after inheritance timeout",
-            );
-        }
-        Ok(derive_vault_key(vault_id))
+    if access_type == "owner" {
+        record_event(
+            vault_id,
+            "DIGITAL_WILL_KEY_ACCESS",
+            "Owner accessed Digital Will key",
+        );
     } else {
-        Err("Access Denied: The inheritance conditions are not met.".to_string())
+        record_event(
+            vault_id,
+            "DIGITAL_WILL_KEY_ACCESS",
+            "Beneficiary accessed Digital Will key after inheritance timeout",
+        );
     }
+
+    Ok(secure_key)
 }
 
 // =======================
@@ -1471,9 +1801,10 @@ async fn request_btc_signature(
 
     let owns = with_state(|state| {
         state
-            .vaults
-            .iter()
-            .any(|v| v.id == vault_id && v.owner == caller)
+            .vault_index
+            .get(&vault_id)
+            .map(|owner| *owner == caller)
+            .unwrap_or(false)
     });
 
     if !owns {
@@ -1503,6 +1834,7 @@ async fn request_btc_signature(
     let mgmt_canister = Principal::from_text("aaaaa-aa").unwrap();
     let cycles: u128 = 30_000_000_000; // 30 billion cycles (buffer for safety)
 
+    #[allow(deprecated)]
     let (resp,): (SignWithEcdsaResponse,) =
         ic_cdk::api::call::call_with_payment128(mgmt_canister, "sign_with_ecdsa", (arg,), cycles)
             .await

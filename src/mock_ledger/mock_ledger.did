@@ -1,0 +1,10 @@
+type Icrc1Account = record {
+  owner: principal;
+  subaccount: opt vec nat8;
+};
+
+service : {
+  icrc1_balance_of: (Icrc1Account) -> (nat) query;
+  set_balance: (principal, opt vec nat8, nat64) -> ();
+  simulate_deposit: (principal, opt vec nat8, nat64) -> (nat);
+}
