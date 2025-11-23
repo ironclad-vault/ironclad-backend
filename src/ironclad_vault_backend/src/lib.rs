@@ -12,11 +12,10 @@ use std::collections::BTreeMap;
 // =======================
 
 // ckBTC / ckTESTBTC ledger canister IDs (from official ICP docs)
-// Mainnet ckBTC ledger:      mxzaz-hqaaa-aaaar-qaada-cai
-// Testnet4 ckTESTBTC ledger: g4xu7-jiaaa-aaaan-aaaaq-cai
-// LOCAL development (dfx replica): mxzaz-hqaaa-aaaar-qaada-cai (using mainnet ID for local deploy)
-const CKBTC_LEDGER_CANISTER_ID: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
-// NOTE: This uses the mainnet ID locally because dfx lets us deploy to any ID. Switch only if deploying to actual testnet.
+// Mainnet ckBTC ledger (REAL MONEY):     mxzaz-hqaaa-aaaar-qaada-cai
+// Mainnet ckTESTBTC ledger (HACKATHON):  mc6ru-gyaaa-aaaar-qaaaq-cai
+const LEDGER_CANISTER_MAINNET: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+const LEDGER_CANISTER_TESTNET: &str = "mc6ru-gyaaa-aaaar-qaaaq-cai";
 
 // Local dfx mock ledger (will be set during init)
 thread_local! {
@@ -41,16 +40,10 @@ struct Icrc1Account {
 }
 
 // --- Transfer structs untuk Withdraw ckBTC ---
-#[derive(CandidType, Deserialize)]
-struct Account {
-    owner: Principal,
-    subaccount: Option<Vec<u8>>,
-}
-
-#[derive(CandidType, Deserialize)]
+#[derive(CandidType, Deserialize, Clone)]
 struct TransferArg {
     from_subaccount: Option<Vec<u8>>,
-    to: Account,
+    to: Icrc1Account,
     amount: Nat,
     fee: Option<Nat>,
     memo: Option<Vec<u8>>,
@@ -63,7 +56,7 @@ enum TransferResult {
     Err(TransferError),
 }
 
-#[derive(CandidType, Deserialize, Debug)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 enum TransferError {
     BadFee { expected_fee: Nat },
     InsufficientFunds { balance: Nat },
@@ -99,10 +92,11 @@ struct SignWithEcdsaResponse {
     signature: Vec<u8>,
 }
 
-#[derive(Clone, CandidType, Deserialize)]
+#[derive(Clone, CandidType, Deserialize, PartialEq, Debug)]
 pub enum NetworkMode {
     Mock,
     CkBTCMainnet,
+    CkBTCTestnet,
 }
 
 #[derive(Clone, Debug, CandidType, Deserialize)]
@@ -378,7 +372,7 @@ fn init() {
     // For production/testnet, this will be overridden by the explicit canister ID.
     // The mock ledger will be deployed as the first canister in dfx.json
     LEDGER_CANISTER_ID.with(|id| {
-        *id.borrow_mut() = Some(CKBTC_LEDGER_CANISTER_ID.to_string());
+        *id.borrow_mut() = Some(LEDGER_CANISTER_MAINNET.to_string());
     });
 }
 
@@ -397,6 +391,12 @@ fn create_vault(
     secure_key: Option<String>,
 ) -> Vault {
     let caller = msg_caller();
+    
+    // SECURITY: Block anonymous users
+    if caller == Principal::anonymous() {
+        ic_cdk::trap("Anonymous calls not allowed. Connect your wallet.");
+    }
+    
     let ts = now_sec();
 
     let vault = with_state_mut(|state| {
@@ -456,6 +456,12 @@ fn create_vault(
 #[query]
 fn get_my_vaults() -> Vec<Vault> {
     let caller = msg_caller();
+    
+    // SECURITY: Block anonymous users
+    if caller == Principal::anonymous() {
+        return Vec::new();
+    }
+    
     with_state(|state| {
         state
             .user_vaults
@@ -519,6 +525,11 @@ fn get_vault_events(id: u64) -> Vec<VaultEvent> {
 /// with real BTC / ckBTC integration.
 #[update]
 fn mock_deposit_vault(id: u64, amount: u64) -> Result<Vault, String> {
+    // Check if we are in Mock mode
+    if !matches!(get_mode(), NetworkMode::Mock) {
+        return Err("Mock deposit only allowed in Mock Mode".to_string());
+    }
+
     let caller = msg_caller();
     let ts = now_sec();
 
@@ -650,10 +661,10 @@ fn preview_withdraw(id: u64) -> Result<u64, String> {
     })
 }
 
-/// Withdraw from a vault (mock flow), updates state and logs events.
+/// Withdraw from a vault - Real ICRC-1 Transfer
 #[update]
 async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
-    // 1. Ambil data vault (Mutable)
+    // 1. Ambil data vault dan validasi
     let (owner, amount_e8s, ckbtc_subaccount) = with_state(|s| {
         let vault = _get_vault(s, vault_id, msg_caller()).ok_or("Vault not found")?;
         
@@ -662,11 +673,7 @@ async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
             return Err("Unauthorized".to_string());
         }
         
-        // Cek apakah sudah waktunya unlock (kecuali masih Mock mode testing)
-        let _current_time = now_sec();
-        // Note: Di production, uncomment baris bawah ini:
-        // if _current_time < vault.lock_until { return Err("Vault is still locked".to_string()); }
-
+        // Cek status vault
         if matches!(vault.status, VaultStatus::Withdrawn) {
             return Err("Vault already withdrawn".to_string());
         }
@@ -675,23 +682,50 @@ async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
     })?;
 
     // 2. Hitung Amount yang ditransfer (Balance - Fee Transaksi)
-    // Fee ckBTC standar = 10 e8s
-    let fee = 10u64;
+    let fee = 10u64; // Fee ckBTC standar = 10 e8s
     if amount_e8s <= fee {
         return Err("Balance too low to cover transfer fee".to_string());
     }
     let transfer_amount = amount_e8s - fee;
 
-    // 3. SIAPKAN PANGGILAN KE LEDGER (Real Transfer)
-    let ledger_principal = Principal::from_text(CKBTC_LEDGER_CANISTER_ID)
+    // 3. Tentukan ledger tujuan berdasarkan network mode
+    let current_mode = get_mode();
+    
+    let ledger_id = match current_mode {
+        NetworkMode::Mock => {
+            // Mock mode: update status tanpa panggil ledger
+            return with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.status = VaultStatus::Withdrawn;
+                    vault.btc_withdraw_txid = Some(format!("MOCK-TXID-{}", vault_id));
+                    vault.balance = 0;
+                    vault.updated_at = now_sec();
+                    Ok(vault.clone())
+                } else {
+                    Err("Vault not found".to_string())
+                }
+            });
+        }
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+    };
+
+    // 4. Optimistic update: kurangi balance duluan untuk prevent re-entrancy
+    with_state_mut(|state| {
+        if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+            vault.balance = vault.balance.saturating_sub(transfer_amount + fee);
+        }
+    });
+
+    // 5. Siapkan transfer ke ledger
+    let ledger_principal = Principal::from_text(&ledger_id)
         .map_err(|_| "Invalid ledger canister ID".to_string())?;
     
-    // PENTING: Transfer dari vault subaccount (tempat user deposit), bukan dari akun utama
     let transfer_args = TransferArg {
-        from_subaccount: ckbtc_subaccount, // Dari subaccount vault tempat user deposit
-        to: Account {
+        from_subaccount: ckbtc_subaccount,
+        to: Icrc1Account {
             owner: owner,
-            subaccount: None, // Ke wallet User (akun utama)
+            subaccount: None,
         },
         amount: Nat::from(transfer_amount),
         fee: None,
@@ -699,7 +733,7 @@ async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
         created_at_time: None,
     };
 
-    // 4. EKSEKUSI TRANSFER (Inter-Canister Call)
+    // 6. Eksekusi transfer
     #[allow(deprecated)]
     let (result,): (TransferResult,) = ic_cdk::call(
         ledger_principal,
@@ -709,10 +743,10 @@ async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
     .await
     .map_err(|e| format!("Failed to call ledger: {:?}", e))?;
 
-    // 5. Handle Hasil Transfer
+    // 7. Handle hasil - Commit atau Rollback
     match result {
         TransferResult::Ok(block_index) => {
-            // SUKSES! Uang sudah pindah, sekarang update status Vault
+            // Sukses! Update status jadi Withdrawn
             let result = with_state_mut(|state| {
                 if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
                     vault.status = VaultStatus::Withdrawn;
@@ -720,18 +754,25 @@ async fn withdraw_vault(vault_id: u64) -> Result<Vault, String> {
                     vault.updated_at = now_sec();
                     Ok(vault.clone())
                 } else {
-                    Err("Vault not found during update".to_string())
+                    Err("Vault not found during finalization".to_string())
                 }
             });
 
             if let Ok(ref _v) = result {
-                record_event(vault_id, "WITHDRAW_COMPLETED", &format!("Real transfer block_index: {}", block_index));
+                record_event(vault_id, "WITHDRAW_COMPLETED", &format!("block_index: {}", block_index));
             }
 
             result
         },
         TransferResult::Err(e) => {
-            // Gagal transfer, jangan ubah status vault
+            // Gagal! Rollback balance
+            with_state_mut(|state| {
+                if let Some(vault) = _get_vault_mut(state, vault_id, msg_caller()) {
+                    vault.balance = vault.balance.saturating_add(transfer_amount + fee);
+                }
+            });
+            
+            record_event(vault_id, "WITHDRAW_FAILED", &format!("{:?}", e));
             Err(format!("Ledger transfer failed: {:?}", e))
         }
     }
@@ -1449,6 +1490,12 @@ fn set_mode_ckbtc_mainnet() {
     MODE.with(|m| *m.borrow_mut() = NetworkMode::CkBTCMainnet);
 }
 
+/// Set runtime mode to ckBTC Testnet (for hackathon - ckTESTBTC mode money)
+#[update]
+fn set_mode_ckbtc_testnet() {
+    MODE.with(|m| *m.borrow_mut() = NetworkMode::CkBTCTestnet);
+}
+
 /// Get current runtime mode
 #[query]
 fn get_mode_query() -> NetworkMode {
@@ -1466,11 +1513,16 @@ fn set_ledger_canister_id(canister_id: String) {
 /// Get current ledger canister ID
 #[query]
 fn get_ledger_canister_id() -> String {
-    LEDGER_CANISTER_ID.with(|id| {
-        id.borrow()
-            .clone()
-            .unwrap_or_else(|| CKBTC_LEDGER_CANISTER_ID.to_string())
-    })
+    let mode = get_mode();
+    match mode {
+        NetworkMode::Mock => LEDGER_CANISTER_ID.with(|id| {
+            id.borrow()
+                .clone()
+                .unwrap_or_else(|| LEDGER_CANISTER_MAINNET.to_string())
+        }),
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+    }
 }
 
 // =======================
@@ -1483,9 +1535,9 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     let caller = msg_caller();
     let mode = get_mode();
 
-    // Only allow in CkBTCMainnet mode
-    if !matches!(mode, NetworkMode::CkBTCMainnet) {
-        return Err("ckBTC sync is only available in CkBTCMainnet mode".to_string());
+    // Allow if mode is CkBTCTestnet OR CkBTCMainnet
+    if !matches!(mode, NetworkMode::CkBTCMainnet | NetworkMode::CkBTCTestnet) {
+        return Err("ckBTC sync is only available in CkBTCTestnet or CkBTCMainnet mode".to_string());
     }
 
     // Find vault and ensure ownership using helper
@@ -1502,11 +1554,12 @@ async fn sync_vault_balance_from_ckbtc(vault_id: u64) -> Result<CkbtcSyncResult,
     }
 
     // Call ckBTC ledger to get balance
-    let ledger_canister_id = LEDGER_CANISTER_ID.with(|id| {
-        id.borrow()
-            .clone()
-            .unwrap_or_else(|| CKBTC_LEDGER_CANISTER_ID.to_string())
-    });
+    let mode = get_mode();
+    let ledger_canister_id = match mode {
+        NetworkMode::CkBTCTestnet => LEDGER_CANISTER_TESTNET.to_string(),
+        NetworkMode::CkBTCMainnet => LEDGER_CANISTER_MAINNET.to_string(),
+        NetworkMode::Mock => return Err("Cannot sync in Mock mode".to_string()),
+    };
     let ledger_id = Principal::from_text(&ledger_canister_id)
         .map_err(|e| format!("Invalid ckBTC ledger canister id: {}", e))?;
 

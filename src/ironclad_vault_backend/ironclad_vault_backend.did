@@ -1,6 +1,7 @@
 type NetworkMode = variant {
     Mock;
     CkBTCMainnet;
+    CkBTCTestnet;
 };
 
 type VaultStatus = variant {
@@ -123,6 +124,7 @@ service : {
     buy_listing: (nat64) -> (variant { Ok: Vault; Err: text });
     set_mode_mock: () -> ();
     set_mode_ckbtc_mainnet: () -> ();
+    set_mode_ckbtc_testnet: () -> ();
     get_mode_query: () -> (NetworkMode) query;
     sync_vault_balance_from_ckbtc: (nat64) -> (variant { Ok: CkbtcSyncResult; Err: text });
     get_deposit_proof: (nat64) -> (variant { Ok: BitcoinTxProof; Err: text }) query;
